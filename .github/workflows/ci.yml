@@ -1,0 +1,74 @@
+name: CI
+
+# Validates every PR and every push to main: engine tests on Linux
+# (fast, cheap), full macOS app build on macOS (catches Xcode-side
+# regressions before they hit the desktop install).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to a PR cancels the in-flight run for that ref — no point
+# burning macOS minutes on stale commits.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: Engine (cargo test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo deps
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Build (library + jsq binary)
+        run: cargo build --all-targets --locked
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+  app:
+    name: macOS app build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo deps
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      # `build-engine.sh` builds the Rust static library and stages
+      # libengine.a + engine.h at the paths Xcode's build phase
+      # expects, so the next step just consumes them.
+      - name: Build engine static library
+        run: scripts/build-engine.sh
+
+      - name: Build app (Debug, ad-hoc signed)
+        run: |
+          xcodebuild \
+            -project app/BigJSON.xcodeproj \
+            -scheme BigJSON \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="-" \
+            build

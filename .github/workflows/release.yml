@@ -1,0 +1,102 @@
+name: Release
+
+# Cuts a new release of the macOS app. Triggered by pushing a tag that
+# matches `v*` (e.g. `git tag v0.1.0 && git push --tags`), or manually
+# from the Actions tab via workflow_dispatch.
+#
+# Produces:
+#   - BigJSON-<version>.dmg attached to the GitHub release
+#
+# The .dmg is ad-hoc signed by default — users will see a Gatekeeper
+# warning on first launch (right-click → Open to bypass). Promote to
+# Developer-ID signing + notarization by setting the secrets listed
+# at the bottom of scripts/release.sh and the matching `env` block
+# below.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to use for the .dmg name (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  # Needed to create the release and upload the .dmg via
+  # softprops/action-gh-release.
+  contents: write
+
+jobs:
+  build:
+    name: Build .dmg and publish release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The release script reads `git rev-parse --short HEAD` as
+          # the fallback version label — full history isn't needed,
+          # but a shallow checkout still gets us the SHA.
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo deps
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Resolve version label
+        id: version
+        run: |
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            # Tag push — refs/tags/v0.1.0 → v0.1.0
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build .dmg
+        # Optional Developer-ID signing + notarization. All five env
+        # vars must be set as repo secrets to activate. With none of
+        # them set, release.sh falls back to ad-hoc signing — fine
+        # for early releases, but the user gets a Gatekeeper warning
+        # on first launch.
+        env:
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          NOTARIZE: ${{ secrets.APPLE_APP_PASSWORD && '1' || '0' }}
+        run: scripts/release.sh "${{ steps.version.outputs.value }}"
+
+      - name: Locate built .dmg
+        id: dmg
+        run: |
+          dmg="$(ls build/BigJSON-*.dmg | head -n1)"
+          if [[ -z "$dmg" ]]; then
+            echo "no .dmg found under build/" >&2
+            exit 1
+          fi
+          echo "path=$dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          # When triggered manually, the workflow may not have a tag
+          # to attach to — pass the resolved name explicitly so the
+          # action creates the release under it. For a tag push,
+          # `tag_name` defaults to `github.ref_name`, but being
+          # explicit costs nothing.
+          tag_name: ${{ steps.version.outputs.value }}
+          name: ${{ steps.version.outputs.value }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: ${{ steps.dmg.outputs.path }}
