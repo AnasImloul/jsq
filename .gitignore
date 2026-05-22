@@ -1,35 +1,68 @@
-# Xcode
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon?
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+
+# --- Xcode ---
+# Per-user state: schemes, breakpoints, window layout.
 xcuserdata/
 *.xcuserstate
 *.xcuserdatad/
-DerivedData/
-build/
 *.xcworkspace/xcuserdata/
+# Old per-user formats from previous Xcode generations.
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+# Build outputs.
+build/
+DerivedData/
+*.dSYM
+*.dSYM.zip
+*.ipa
+*.xcarchive
+# Index / caches.
+*.swiftdoc
+*.swiftsourceinfo
 
-# Swift Package Manager
+# --- Swift Package Manager ---
 .build/
 .swiftpm/
 Package.resolved
 
-# Rust (engine crate)
+# --- Rust ---
 target/
-# Cargo.lock IS committed — the engine produces a binary artifact and we
-# want reproducible builds.
-
-# macOS
-.DS_Store
-
-# Editor
-.vscode/
-.idea/
-.claude/
-*.swp
-
-# Local test data / scratch
-big.json
-results.json
-PLAN.md
+*.rs.bk
+# Cargo.lock IS committed — the engine produces a binary artifact and
+# we want reproducible builds. (Libraries-only crates would unignore it.)
 
 # Engine artifacts written by scripts/build-engine.sh (the static
 # library + staged header). Regenerated on every Xcode build.
 engine/build/
+
+# --- Editor / IDE scratch ---
+.vscode/
+.idea/
+.claude/
+.cursor/
+.history/
+*.swp
+*.swo
+*~
+
+# --- Secrets / local config ---
+.env
+.env.local
+.env.*.local
+
+# --- Local fixtures + scratch the dev keeps next to the repo ---
+big.json
+results.json
+PLAN.md
+*.log
