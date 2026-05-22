@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5046E5"/>
+      <stop offset="0.55" stop-color="#3A6EE0"/>
+      <stop offset="1" stop-color="#0EB5C4"/>
+    </linearGradient>
+
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.18"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0.04"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.12"/>
+    </linearGradient>
+
+    <filter id="ds" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#000" flood-opacity="0.20"/>
+    </filter>
+
+    <filter id="innerShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+      <feOffset dx="0" dy="3" result="off"/>
+      <feComposite in="off" in2="SourceAlpha" operator="arithmetic" k2="-1" k3="1" result="cut"/>
+      <feFlood flood-color="#000" flood-opacity="0.22"/>
+      <feComposite in2="cut" operator="in"/>
+      <feComposite in2="SourceGraphic" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Big Sur–style rounded square with gradient and gloss -->
+  <g>
+    <rect x="0" y="0" width="1024" height="1024" rx="220" ry="220" fill="url(#bg)"/>
+    <rect x="0" y="0" width="1024" height="1024" rx="220" ry="220" fill="url(#sheen)"/>
+    <rect x="6" y="6" width="1012" height="1012" rx="216" ry="216"
+          fill="none" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="2"/>
+  </g>
+
+  <!-- JSON-ish content lines in the middle, between the braces -->
+  <g filter="url(#ds)">
+    <!-- row 1 -->
+    <rect x="396" y="372" width="92"  height="36" rx="14" fill="#FFFFFF" opacity="0.96"/>
+    <rect x="510" y="372" width="160" height="36" rx="14" fill="#A8F1FF" opacity="0.92"/>
+
+    <!-- row 2 -->
+    <rect x="396" y="488" width="124" height="36" rx="14" fill="#FFFFFF" opacity="0.96"/>
+    <rect x="544" y="488" width="120" height="36" rx="14" fill="#FFD79A" opacity="0.92"/>
+
+    <!-- row 3 -->
+    <rect x="396" y="604" width="76"  height="36" rx="14" fill="#FFFFFF" opacity="0.96"/>
+    <rect x="494" y="604" width="172" height="36" rx="14" fill="#C9B6FF" opacity="0.92"/>
+  </g>
+
+  <!-- Curly braces drawn as thick rounded strokes.
+       Each brace = top arm, midpoint cusp, bottom arm.  -->
+  <g fill="none" stroke="#FFFFFF" stroke-width="56"
+     stroke-linecap="round" stroke-linejoin="round" filter="url(#ds)">
+    <!-- Left brace { -->
+    <path d="
+      M 354 264
+      L 318 264
+      C 274 264 274 308 274 350
+      L 274 470
+      C 274 504 250 512 214 512
+      C 250 512 274 520 274 554
+      L 274 674
+      C 274 716 274 760 318 760
+      L 354 760"/>
+
+    <!-- Right brace } (mirrored about x=512) -->
+    <path d="
+      M 670 264
+      L 706 264
+      C 750 264 750 308 750 350
+      L 750 470
+      C 750 504 774 512 810 512
+      C 774 512 750 520 750 554
+      L 750 674
+      C 750 716 750 760 706 760
+      L 670 760"/>
+  </g>
+
+  <!-- Subtle inner highlight on top edge -->
+  <rect x="0" y="0" width="1024" height="220" rx="220" ry="220"
+        fill="#FFFFFF" opacity="0.04"/>
+</svg>

@@ -1,0 +1,34 @@
+# Xcode
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+DerivedData/
+build/
+*.xcworkspace/xcuserdata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Rust (engine crate)
+target/
+# Cargo.lock IS committed — the engine produces a binary artifact and we
+# want reproducible builds.
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Local test data / scratch
+big.json
+results.json
+PLAN.md
+
+# Engine artifacts written by scripts/build-engine.sh (the static
+# library + staged header). Regenerated on every Xcode build.
+engine/build/

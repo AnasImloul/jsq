@@ -1,0 +1,26 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "engine"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "jsq"
+path = "src/bin/jsq.rs"
+
+[dependencies]
+memmap2 = "0.9"
+rustc-hash = "2"
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = true
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+codegen-units = 1
