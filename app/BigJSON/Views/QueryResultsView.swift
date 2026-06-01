@@ -772,7 +772,7 @@ enum ContainerKind: Equatable {
     var closeBrace: String { self == .object ? "}" : "]" }
 }
 
-enum ContainerChildren {
+indirect enum ContainerChildren {
     case eager([(String, ResultsNode)])
     case lazy(LazyMeta)
 }
