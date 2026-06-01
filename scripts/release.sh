@@ -37,6 +37,10 @@ rm -rf "$BUILD_DIR" "$DMG_FILE"
 mkdir -p "$BUILD_DIR" "$STAGING_DIR"
 
 echo "==> Building Release configuration"
+# Filter the (very noisy) xcodebuild output down to the lines worth seeing,
+# but keep xcodebuild's own exit status via PIPESTATUS — piping into grep
+# would otherwise mask a build failure and let us package a hollow .app.
+set +e
 xcodebuild \
     -project "$PROJECT_DIR/app/BigJSON.xcodeproj" \
     -scheme "$SCHEME" \
@@ -46,11 +50,24 @@ xcodebuild \
     CODE_SIGN_STYLE=Manual \
     CODE_SIGNING_REQUIRED=NO \
     CODE_SIGN_IDENTITY="-" \
-    build | grep -E '(error|warning|BUILD)' || true
+    build 2>&1 | grep -E '(error|warning|BUILD)'
+build_status=${PIPESTATUS[0]}
+set -e
+if [[ "$build_status" -ne 0 ]]; then
+    echo "ERROR: xcodebuild failed (exit $build_status)" >&2
+    exit 1
+fi
 
 APP_PATH="$BUILD_DIR/DerivedData/Build/Products/Release/$APP_NAME"
 if [[ ! -d "$APP_PATH" ]]; then
     echo "ERROR: Built app not found at $APP_PATH" >&2
+    exit 1
+fi
+# A failed link can still leave a skeleton bundle (Info.plist + Resources)
+# with an empty MacOS/. Refuse to package an app with no executable.
+EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/$SCHEME"
+if [[ ! -x "$EXECUTABLE_PATH" ]]; then
+    echo "ERROR: built app has no executable at $EXECUTABLE_PATH" >&2
     exit 1
 fi
 
