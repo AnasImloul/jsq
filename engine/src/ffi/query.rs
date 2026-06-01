@@ -9,6 +9,8 @@ use std::os::raw::c_char;
 
 use crate::document::{Document, NULL_NODE};
 use crate::query::evaluator::QueryResult;
+use crate::query::evaluator::render as value_render;
+use crate::query::value::Value;
 use crate::query::{self, evaluator, QueryError};
 
 use super::{push_json_escaped, string_to_owned_bytes, EngineOwnedBytes, EngineSlice};
@@ -50,6 +52,30 @@ pub struct QueryResults {
     /// memory-bandwidth-bound queries — when this approaches the
     /// file size the engine touched most of the document.
     pub scanned_bytes: u64,
+    /// Per-row presentation strings (`(preview, full_text)`) the Swift
+    /// table view reads via `engine_query_results_at`. Built eagerly so
+    /// the FFI handle owns the bytes for its full lifetime — `_at`
+    /// hands out borrowed slices into these strings, so they need a
+    /// stable address. The engine row itself (`QueryResult`) carries
+    /// only the structured `Value`; everything string-y is derived.
+    pub presentation: Vec<RowPresentation>,
+}
+
+pub struct RowPresentation {
+    pub preview: String,
+    pub full_text: String,
+}
+
+fn build_presentation(results: &[QueryResult], doc: &Document) -> Vec<RowPresentation> {
+    results
+        .iter()
+        .map(|r| {
+            let preview = value_render::value_preview(doc, &r.value, 80);
+            let mut full_text = String::new();
+            value_render::write_value_json(&mut full_text, doc, &r.value);
+            RowPresentation { preview, full_text }
+        })
+        .collect()
 }
 
 #[repr(C)]
@@ -149,6 +175,7 @@ pub extern "C" fn engine_query_run(
         }
         None => None,
     };
+    let presentation = build_presentation(&output.results, d);
     Box::into_raw(Box::new(QueryResults {
         results: output.results,
         hit_limit: output.hit_limit,
@@ -156,6 +183,7 @@ pub extern "C" fn engine_query_run(
         scanned_rows: output.scanned_rows,
         lookup_calls: output.lookup_calls,
         scanned_bytes: output.scanned_bytes,
+        presentation,
     }))
 }
 
@@ -180,6 +208,7 @@ pub extern "C" fn engine_query_text_search(
         return std::ptr::null_mut();
     }
     let output = evaluator::text_search(d, bytes, limit as usize);
+    let presentation = build_presentation(&output.results, d);
     Box::into_raw(Box::new(QueryResults {
         results: output.results,
         hit_limit: output.hit_limit,
@@ -187,6 +216,7 @@ pub extern "C" fn engine_query_text_search(
         scanned_rows: output.scanned_rows,
         lookup_calls: output.lookup_calls,
         scanned_bytes: output.scanned_bytes,
+        presentation,
     }))
 }
 
@@ -246,13 +276,26 @@ pub extern "C" fn engine_query_results_at(
 ) -> EngineQueryResultView {
     let Some(r) = (unsafe { results.as_ref() }) else { return EngineQueryResultView::empty() };
     let Some(item) = r.results.get(idx as usize) else { return EngineQueryResultView::empty() };
+    let Some(present) = r.presentation.get(idx as usize) else {
+        return EngineQueryResultView::empty();
+    };
+    // `node_id` is the only Swift-side click-through hint. For real
+    // document nodes it's the record id; for synthetic rows we surface
+    // NULL_NODE so the table view's `nodeID != nil` check skips them.
+    // GroupList rows used to advertise their first member's id so the
+    // inspector could jump into the bucket — preserve that here.
+    let node_id = match &item.value {
+        Value::Node(id) => *id,
+        Value::GroupList { members, .. } => members.first().copied().unwrap_or(NULL_NODE),
+        _ => NULL_NODE,
+    };
     EngineQueryResultView {
-        node_id: item.node_id,
+        node_id,
         kind: item.kind,
         _pad: [0; 3],
         path: EngineSlice::from_slice(item.path.as_bytes()),
-        preview: EngineSlice::from_slice(item.preview.as_bytes()),
-        full_text: EngineSlice::from_slice(item.full_text.as_bytes()),
+        preview: EngineSlice::from_slice(present.preview.as_bytes()),
+        full_text: EngineSlice::from_slice(present.full_text.as_bytes()),
     }
 }
 
@@ -288,10 +331,14 @@ pub extern "C" fn engine_render_json_array(
 }
 
 #[no_mangle]
-pub extern "C" fn engine_render_csv(results: *const QueryResults) -> EngineOwnedBytes {
+pub extern "C" fn engine_render_csv(
+    results: *const QueryResults,
+    doc: *const Document,
+) -> EngineOwnedBytes {
     let empty = EngineOwnedBytes { data: std::ptr::null_mut(), length: 0 };
     let Some(r) = (unsafe { results.as_ref() }) else { return empty };
-    string_to_owned_bytes(crate::render::render_csv(&r.results))
+    let Some(d) = (unsafe { doc.as_ref() }) else { return empty };
+    string_to_owned_bytes(crate::render::render_csv(&r.results, d))
 }
 
 /// Render-format discriminant for `engine_query_run_and_render`.
@@ -345,7 +392,7 @@ pub extern "C" fn engine_query_run_and_render(
     let bytes = match format {
         ENGINE_RENDER_NDJSON => crate::render::render_ndjson(&output.results, d),
         ENGINE_RENDER_JSON_ARRAY => crate::render::render_json_array(&output.results, d),
-        ENGINE_RENDER_CSV => crate::render::render_csv(&output.results),
+        ENGINE_RENDER_CSV => crate::render::render_csv(&output.results, d),
         _ => return empty,
     };
     string_to_owned_bytes(bytes)

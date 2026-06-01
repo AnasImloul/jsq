@@ -11,8 +11,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+use std::collections::HashMap;
+
 use engine::document::Document;
-use engine::query::{self, evaluator};
+use engine::query::{self, evaluator, ParamValue};
 use engine::render;
 
 /// SQL-shaped query tool for very-large JSON files. Always emits one
@@ -50,6 +52,12 @@ struct Args {
     /// output through `head` if you want a hard cap.
     #[arg(short = 'n', long, value_name = "N")]
     limit: Option<usize>,
+
+    /// Bind a `$name` query parameter: `--param NAME=VALUE` (repeatable).
+    /// VALUE is read as a JSON scalar — `true`/`false`/`null`, a number,
+    /// or a `"quoted"` string; anything else is taken as a raw string.
+    #[arg(short = 'p', long = "param", value_name = "NAME=VALUE")]
+    params: Vec<String>,
 
     /// Print the lowered engine AST instead of running the query.
     /// Useful when debugging surface-syntax → engine translation.
@@ -99,10 +107,18 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     };
 
+    let params = match parse_params(&args.params) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("jsq: {}", msg);
+            return ExitCode::from(1);
+        }
+    };
+
     // --explain: compile and lower, print canonical AST. No document
     // needed — this is purely a parser/lowerer debugging aid.
     if args.explain {
-        match query::compile(&query) {
+        match query::compile_with_params(&query, &params) {
             Ok(ast) => {
                 println!("{}", ast);
                 return ExitCode::SUCCESS;
@@ -122,7 +138,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let ast = match query::compile(&query) {
+    let ast = match query::compile_with_params(&query, &params) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("jsq: parse error at position {}: {}", e.position, e.message);
@@ -134,6 +150,8 @@ fn main() -> ExitCode {
     // largest finite cap usize can hold (the FFI's u32 limit doesn't
     // apply here since we're calling Rust directly).
     let limit = args.limit.unwrap_or(usize::MAX);
+
+    evaluator::build_indexes(&doc, &ast);
 
     let started = std::time::Instant::now();
     let output = evaluator::run(&doc, &ast, 0, limit);
@@ -159,6 +177,40 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Parses `--param NAME=VALUE` strings into a parameter map. VALUE is
+/// read as a JSON scalar: `true`/`false`/`null`, a number, or a
+/// `"quoted"` string; anything else is taken as a raw (unquoted) string.
+fn parse_params(raw: &[String]) -> Result<HashMap<String, ParamValue>, String> {
+    let mut out = HashMap::with_capacity(raw.len());
+    for entry in raw {
+        let (name, value) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("--param expects NAME=VALUE, got `{}`", entry))?;
+        if name.is_empty() {
+            return Err(format!("--param has an empty name: `{}`", entry));
+        }
+        out.insert(name.to_string(), parse_param_value(value));
+    }
+    Ok(out)
+}
+
+fn parse_param_value(s: &str) -> ParamValue {
+    let t = s.trim();
+    match t {
+        "true" => return ParamValue::Bool(true),
+        "false" => return ParamValue::Bool(false),
+        "null" => return ParamValue::Null,
+        _ => {}
+    }
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        return ParamValue::Str(t[1..t.len() - 1].to_string());
+    }
+    if let Ok(n) = t.parse::<f64>() {
+        return ParamValue::Number(n);
+    }
+    ParamValue::Str(s.to_string())
 }
 
 fn write_stats(output: &evaluator::EvalOutput, elapsed: std::time::Duration) {

@@ -15,12 +15,6 @@
 //!   * `where P` becomes `Select(P)`. Top-level And/Or chains are
 //!     cost-reordered so cheap predicates short-circuit first.
 //!
-//!   * `partition { N: P, ... }` is stored on the side; consumed only by
-//!     the `aggregate each partition` form, which expands into a
-//!     standard `AggregateBlock` with one item per partition (predicate
-//!     fused into the item's `where`, name substituted into any
-//!     `ALIAS.name` reference inside the body).
-//!
 //!   * `let NAME = EXPR` (post-where) is alias substitution into the
 //!     aggregate body at lowering time. Never reaches the engine.
 
@@ -31,33 +25,68 @@ use super::super::ast::{
 };
 use super::super::QueryError;
 use super::ast::{
-    AggBlockItem, AggOp, AggregateBlock, AggregateClause, AggregateShorthand, AliasLet, BinaryOp,
-    EachPartitionClause, Expr, FieldSetItem, GroupClause, JoinClause, Lit, ObjectField,
-    PartitionDef, PathExpr, PathRoot, PathSeg, Query, SourceClause,
+    AggBlockItem, AggOp, AggregateBlock, AggregateClause, AliasLet, BinaryOp, Expr, FieldSetItem,
+    GroupClause, JoinClause, JoinKind, Lit, ObjectField, PathExpr, PathRoot, PathSeg, Query,
+    SourceClause, UnnestClause,
 };
+
+/// A value bound to a `$name` query parameter. Substituted in for the
+/// matching `Expr::Param` during lowering.
+#[derive(Clone, Debug)]
+pub enum ParamValue {
+    Number(f64),
+    Str(String),
+    Bool(bool),
+    Null,
+}
+
+fn param_to_ast(v: &ParamValue) -> Ast {
+    match v {
+        ParamValue::Number(n) => Ast::LitNumber(*n),
+        ParamValue::Str(s) => Ast::LitString(s.clone()),
+        ParamValue::Bool(b) => Ast::LitBool(*b),
+        ParamValue::Null => Ast::LitNull,
+    }
+}
 
 /// Lowering context. `aliases` tracks runtime row bindings (`from`/`join`
 /// aliases — read via `Ast::Var`); `lets` is the compile-time field-set
-/// macro table.
+/// macro table; `params` holds caller-supplied `$name` bindings.
 struct Env {
     aliases: std::collections::HashSet<String>,
     lets: HashMap<String, Vec<String>>,
+    params: HashMap<String, ParamValue>,
 }
 
-pub fn lower_query(q: Query) -> Result<Ast, QueryError> {
+pub fn lower_query(q: Query, params: &HashMap<String, ParamValue>) -> Result<Ast, QueryError> {
+    lower_query_scoped(&q, params, &std::collections::HashSet::new())
+}
+
+/// Lowers a query whose `from`/`join`/`unnest` aliases start out with
+/// `parent_aliases` already in scope. The top-level entry passes an empty
+/// set; a correlated subquery (`Expr::Subquery`) passes the enclosing
+/// query's aliases so inner paths like `o.x == c.id` resolve `c` and so a
+/// reused alias name is rejected (which also keeps the runtime binding map
+/// uncorrupted — the inner `Let` can never overwrite an outer binding).
+fn lower_query_scoped(
+    q: &Query,
+    params: &HashMap<String, ParamValue>,
+    parent_aliases: &std::collections::HashSet<String>,
+) -> Result<Ast, QueryError> {
     let mut env = Env {
-        aliases: std::collections::HashSet::new(),
+        aliases: parent_aliases.clone(),
         lets: HashMap::new(),
+        params: params.clone(),
     };
-    for lb in &q.lets {
-        env.lets.insert(lb.name.clone(), lb.fields.clone());
+    for fs in &q.field_sets {
+        env.lets.insert(fs.name.clone(), fs.fields.clone());
     }
 
     // ----- source -----
     //
     // `from PATH as ALIAS` lowers to `PATH | Let { ALIAS = . }`. The
     // path emits whatever it emits — iteration is always explicit via
-    // `[*]`, so there is exactly one spelling for iteration in the
+    // `[]`, so there is exactly one spelling for iteration in the
     // surface language. The Tap wraps the source-emitting prefix so
     // "rows scanned" counts what the alias actually saw.
     let SourceClause {
@@ -82,19 +111,35 @@ pub fn lower_query(q: Query) -> Result<Ast, QueryError> {
     env.aliases.insert(source_alias.clone());
 
     // ----- joins -----
-    for JoinClause { path, alias, on } in &q.joins {
+    for JoinClause { path, alias, on, kind } in &q.joins {
         if env.aliases.contains(alias) {
             return Err(QueryError::new(
                 0,
                 format!("duplicate alias `{}`", alias),
             ));
         }
-        let lookup_value = lower_join_to_lookup(alias, path, on, &env)?;
+        let join_node = lower_join_to_lookup(alias, path, on, *kind, &env)?;
+        pipeline = pipe(pipeline, join_node);
+        env.aliases.insert(alias.clone());
+    }
+
+    // ----- unnest -----
+    //
+    // `unnest EXPR as ALIAS` lowers to an `UnnestEach` fan-out stage: the
+    // engine iterates the array `EXPR` produces and re-emits the row once
+    // per element with `ALIAS` bound. The expression is lowered with the
+    // aliases bound so far in scope, then the new alias joins the set so
+    // subsequent clauses (and later unnests) can reference it.
+    for UnnestClause { expr, alias } in &q.unnests {
+        if env.aliases.contains(alias) {
+            return Err(QueryError::new(0, format!("duplicate alias `{}`", alias)));
+        }
+        let source = lower_expr(expr, &env)?;
         pipeline = pipe(
             pipeline,
-            Ast::Let {
-                name: alias.clone(),
-                value: Box::new(lookup_value),
+            Ast::UnnestEach {
+                alias: alias.clone(),
+                source: Box::new(source),
             },
         );
         env.aliases.insert(alias.clone());
@@ -112,54 +157,43 @@ pub fn lower_query(q: Query) -> Result<Ast, QueryError> {
         pipeline = pipe(pipeline, Ast::Distinct);
     }
 
-    // ----- aggregate (with partition/alias_let preprocessing) -----
+    // ----- aggregate (with alias_let preprocessing) -----
     //
-    // `alias_lets` and `partition`s only attach to an aggregate block or
-    // an `aggregate each partition` form — anywhere else they're an
-    // unused declaration and should fail loudly.
-    let needs_agg_block = matches!(
-        q.aggregate,
-        Some(AggregateClause::Block(_)) | Some(AggregateClause::EachPartition(_))
-    );
+    // `alias_lets` only attach to an `aggregate { ... }` block — anywhere
+    // else they're an unused declaration and should fail loudly.
+    let needs_agg_block = matches!(q.aggregate, Some(AggregateClause::Block(_)));
     if !q.alias_lets.is_empty() && !needs_agg_block {
         return Err(QueryError::new(
             0,
-            "`let NAME = EXPR` (post-where) only applies to an `aggregate { ... }` \
-             or `aggregate each partition` clause"
-                .into(),
-        ));
-    }
-    if !q.partitions.is_empty()
-        && !matches!(q.aggregate, Some(AggregateClause::EachPartition(_)))
-    {
-        return Err(QueryError::new(
-            0,
-            "`partition { ... }` only applies to an `aggregate each partition` clause"
-                .into(),
-        ));
-    }
-    if matches!(q.aggregate, Some(AggregateClause::EachPartition(_))) && q.partitions.is_empty() {
-        return Err(QueryError::new(
-            0,
-            "`aggregate each partition` requires a preceding `partition { ... }` block"
+            "`let NAME = EXPR` (post-where) only applies to an `aggregate { ... }` clause"
                 .into(),
         ));
     }
 
     if let Some(agg) = &q.aggregate {
         pipeline = match agg {
-            AggregateClause::Shorthand(s) => lower_aggregate(pipeline, s, &env)?,
             AggregateClause::Block(b) => {
                 let expanded = preprocess_alias_lets(b, &q.alias_lets, &env)?;
                 lower_aggregate_block(pipeline, &expanded, &env)?
             }
             AggregateClause::Group(g) => lower_group(pipeline, g, &env)?,
-            AggregateClause::EachPartition(ep) => {
-                let expanded = expand_each_partition(ep, &q.partitions)?;
-                let expanded = preprocess_alias_lets(&expanded, &q.alias_lets, &env)?;
-                lower_aggregate_block(pipeline, &expanded, &env)?
-            }
         };
+    }
+
+    // ----- having -----
+    //
+    // Post-aggregate filter over the reduced bucket-row stream. Output
+    // fields are addressed by identity path (`.n`), which the engine
+    // resolves against `Value::BucketRow` by name.
+    if let Some(pred) = &q.having {
+        if q.aggregate.is_none() {
+            return Err(QueryError::new(
+                0,
+                "`having` requires an `aggregate { ... }` clause".into(),
+            ));
+        }
+        let p = lower_expr(pred, &env)?;
+        pipeline = pipe(pipeline, Ast::Select(Box::new(p)));
     }
 
     // ----- select -----
@@ -175,8 +209,7 @@ pub fn lower_query(q: Query) -> Result<Ast, QueryError> {
     if !q.order_by.is_empty() {
         let mut keys = Vec::with_capacity(q.order_by.len());
         for k in &q.order_by {
-            let rewritten = rewrite_for_order_by(&k.expr, &env);
-            let key_ast = lower_expr(&rewritten, &env)?;
+            let key_ast = lower_expr(&k.expr, &env)?;
             let dir = if k.desc { SortDir::Desc } else { SortDir::Asc };
             keys.push((Box::new(key_ast), dir));
         }
@@ -204,74 +237,109 @@ fn lower_join_to_lookup(
     alias: &str,
     path: &PathExpr,
     on: &Expr,
+    kind: JoinKind,
     env: &Env,
 ) -> Result<Ast, QueryError> {
-    let (left, right) = match on {
-        Expr::Compare(l, CompareOp::Eq, r) => (l.as_ref(), r.as_ref()),
-        _ => {
-            return Err(QueryError::new(
-                0,
-                "join `on` predicate must be a single equality `LEFT == RIGHT`".into(),
-            ));
-        }
-    };
+    // A join key is one equality or an `and`-chain of them (composite key).
+    let mut equalities: Vec<(&Expr, &Expr)> = Vec::new();
+    collect_join_equalities(on, &mut equalities)?;
 
-    let left_refs_new = references_alias(left, alias);
-    let right_refs_new = references_alias(right, alias);
-
-    let (outer_key, inner_key) = match (left_refs_new, right_refs_new) {
-        (true, false) => (right, left),
-        (false, true) => (left, right),
-        (true, true) => {
-            return Err(QueryError::new(
-                0,
-                format!(
-                    "join `on` predicate must split `{}.field` against a prior-alias \
-                     expression — both sides reference `{}`",
-                    alias, alias
-                ),
-            ));
-        }
-        (false, false) => {
-            return Err(QueryError::new(
-                0,
-                format!(
-                    "join `on` predicate must reference the new alias `{}` on exactly one side",
-                    alias
-                ),
-            ));
-        }
-    };
-
-    // Outer key evaluates against the current pipeline row (with prior
-    // aliases bound). Inner key strips the new alias's prefix so it
-    // becomes Identity-rooted — that's what the engine's `Lookup`
+    // Outer keys evaluate against the current pipeline row (with prior
+    // aliases bound). Inner keys strip the new alias's prefix so they
+    // become Identity-rooted — that's what the engine's `Lookup`
     // evaluates against each candidate row.
-    let outer_key_ast = lower_expr(outer_key, env)?;
-    let inner_stripped = strip_alias_prefix(inner_key, alias);
-    let inner_key_ast = lower_expr(&inner_stripped, env)?;
+    let mut outer_keys: Vec<Ast> = Vec::with_capacity(equalities.len());
+    let mut inner_keys: Vec<Ast> = Vec::with_capacity(equalities.len());
+    for (left, right) in equalities {
+        let (outer_key, inner_key) = split_join_equality(left, right, alias)?;
+        outer_keys.push(lower_expr(outer_key, env)?);
+        let inner_stripped = strip_alias_prefix(inner_key, alias);
+        inner_keys.push(lower_expr(&inner_stripped, env)?);
+    }
+
+    // A single equality lowers to a flat scalar key; multiple wrap in a
+    // KeyTuple so both sides render identically (U+001F-joined) and the
+    // index's ScalarKey::Str match works without extra machinery.
+    let (outer_key_ast, inner_key_ast) = if outer_keys.len() == 1 {
+        (outer_keys.pop().unwrap(), inner_keys.pop().unwrap())
+    } else {
+        (Ast::KeyTuple(outer_keys), Ast::KeyTuple(inner_keys))
+    };
 
     let source_ast = lower_path(path, env)?;
 
     let source_canon = source_ast.to_string();
     let key_canon = inner_key_ast.to_string();
 
-    Ok(pipe(
-        outer_key_ast,
-        Ast::Lookup {
+    Ok(Ast::JoinEach {
+        alias: alias.to_string(),
+        outer_key: Box::new(outer_key_ast),
+        lookup: Box::new(Ast::Lookup {
             source: Box::new(source_ast),
             key: Box::new(inner_key_ast),
             source_canon,
             key_canon,
-        },
-    ))
+        }),
+        inner: matches!(kind, JoinKind::Inner),
+    })
+}
+
+/// Flattens a join `on` predicate into its equality conjuncts: either a
+/// single `LEFT == RIGHT` or an `and`-chain of them.
+fn collect_join_equalities<'a>(
+    on: &'a Expr,
+    out: &mut Vec<(&'a Expr, &'a Expr)>,
+) -> Result<(), QueryError> {
+    match on {
+        Expr::Compare(l, CompareOp::Eq, r) => {
+            out.push((l.as_ref(), r.as_ref()));
+            Ok(())
+        }
+        Expr::And(l, r) => {
+            collect_join_equalities(l, out)?;
+            collect_join_equalities(r, out)
+        }
+        _ => Err(QueryError::new(
+            0,
+            "join `on` predicate must be an equality `LEFT == RIGHT` or an \
+             `and`-chain of equalities".into(),
+        )),
+    }
+}
+
+/// Splits one equality into `(outer, inner)` keys by which side
+/// references the new alias.
+fn split_join_equality<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+    alias: &str,
+) -> Result<(&'a Expr, &'a Expr), QueryError> {
+    match (references_alias(left, alias), references_alias(right, alias)) {
+        (true, false) => Ok((right, left)),
+        (false, true) => Ok((left, right)),
+        (true, true) => Err(QueryError::new(
+            0,
+            format!(
+                "join `on` predicate must split `{}.field` against a prior-alias \
+                 expression — both sides reference `{}`",
+                alias, alias
+            ),
+        )),
+        (false, false) => Err(QueryError::new(
+            0,
+            format!(
+                "join `on` predicate must reference the new alias `{}` on exactly one side",
+                alias
+            ),
+        )),
+    }
 }
 
 /// True if `e` contains any `Path` whose root is `Name(alias)`.
 fn references_alias(e: &Expr, alias: &str) -> bool {
     match e {
         Expr::Path(p) => matches!(&p.root, PathRoot::Name(n) if n == alias),
-        Expr::Lit(_) => false,
+        Expr::Lit(_) | Expr::Param(_) => false,
         Expr::Array(xs) => xs.iter().any(|x| references_alias(x, alias)),
         Expr::FieldSetCompare { base, rhs, .. } => {
             matches!(&base.root, PathRoot::Name(n) if n == alias)
@@ -293,10 +361,16 @@ fn references_alias(e: &Expr, alias: &str) -> bool {
                 || f.default.as_ref().is_some_and(|d| references_alias(d, alias))
         }),
         Expr::TypeTest { value, .. } => references_alias(value, alias),
-        Expr::Round { value, precision } => {
-            references_alias(value, alias)
-                || precision.as_ref().is_some_and(|p| references_alias(p, alias))
+        Expr::Call(_, args) => args.iter().any(|a| references_alias(a, alias)),
+        Expr::If { cond, then_branch, else_branch } => {
+            references_alias(cond, alias)
+                || references_alias(then_branch, alias)
+                || references_alias(else_branch, alias)
         }
+        // A subquery is opaque to the join-key splitter: its own body
+        // owns its alias scope, and join `on` predicates don't contain
+        // subqueries, so it never references the join's new alias.
+        Expr::Subquery(_) => false,
     }
 }
 
@@ -306,7 +380,7 @@ fn references_alias(e: &Expr, alias: &str) -> bool {
 fn strip_alias_prefix(e: &Expr, alias: &str) -> Expr {
     match e {
         Expr::Path(p) => Expr::Path(strip_alias_in_path(p, alias)),
-        Expr::Lit(_) => e.clone(),
+        Expr::Lit(_) | Expr::Param(_) => e.clone(),
         Expr::Array(xs) => Expr::Array(xs.iter().map(|x| strip_alias_prefix(x, alias)).collect()),
         Expr::FieldSetCompare { base, items, op, rhs } => Expr::FieldSetCompare {
             base: strip_alias_in_path(base, alias),
@@ -362,10 +436,19 @@ fn strip_alias_prefix(e: &Expr, alias: &str) -> Expr {
             kind: *kind,
             negated: *negated,
         },
-        Expr::Round { value, precision } => Expr::Round {
-            value: Box::new(strip_alias_prefix(value, alias)),
-            precision: precision.as_ref().map(|p| Box::new(strip_alias_prefix(p, alias))),
+        Expr::Call(name, args) => Expr::Call(
+            name.clone(),
+            args.iter().map(|a| strip_alias_prefix(a, alias)).collect(),
+        ),
+        Expr::If { cond, then_branch, else_branch } => Expr::If {
+            cond: Box::new(strip_alias_prefix(cond, alias)),
+            then_branch: Box::new(strip_alias_prefix(then_branch, alias)),
+            else_branch: Box::new(strip_alias_prefix(else_branch, alias)),
         },
+        // Subqueries own their alias scope — the join inner-key rewrite
+        // doesn't reach inside one. (Subqueries aren't part of a join's
+        // `on` predicate in the surface, so this arm is conservative.)
+        Expr::Subquery(_) => e.clone(),
     }
 }
 
@@ -376,124 +459,6 @@ fn strip_alias_in_path(p: &PathExpr, alias: &str) -> PathExpr {
             segments: p.segments.clone(),
         },
         _ => p.clone(),
-    }
-}
-
-// ===== each-partition expansion =====
-
-/// Expands `aggregate each partition as p => p.name: { BODY }` into a
-/// standard `AggregateBlock`: one `AggBlockItem` per declared partition,
-/// where the item's name is the partition's name, its `where_pred` is
-/// the partition's predicate, and its `output` is BODY with every
-/// `ALIAS.name` reference substituted with the partition-name literal.
-fn expand_each_partition(
-    clause: &EachPartitionClause,
-    partitions: &[PartitionDef],
-) -> Result<AggregateBlock, QueryError> {
-    let mut reductions = Vec::with_capacity(partitions.len());
-    for p in partitions {
-        let body = substitute_partition_name(&clause.body, &clause.partition_alias, &p.name);
-        reductions.push(AggBlockItem {
-            name: p.name.clone(),
-            output: body,
-            where_pred: Some(p.pred.clone()),
-            default: None,
-        });
-    }
-    Ok(AggregateBlock {
-        reductions,
-        group_by: None,
-    })
-}
-
-/// Substitutes any `ALIAS.name` path (root=Name(alias), exactly one
-/// segment Field("name")) inside `e` with a string-literal of the
-/// partition name. Other paths rooted at `ALIAS` are illegal (the
-/// parser already enforces `ALIAS.name` at the body header — but
-/// re-checking inside lets the body itself reference `p.name`
-/// elsewhere if the user wants to embed it).
-fn substitute_partition_name(e: &Expr, alias: &str, partition_name: &str) -> Expr {
-    match e {
-        Expr::Path(p) => {
-            if matches!(&p.root, PathRoot::Name(n) if n == alias)
-                && p.segments.len() == 1
-                && matches!(&p.segments[0], PathSeg::Field(f) if f == "name")
-            {
-                return Expr::Lit(Lit::Str(partition_name.to_string()));
-            }
-            Expr::Path(p.clone())
-        }
-        Expr::Lit(_) => e.clone(),
-        Expr::Array(xs) => Expr::Array(
-            xs.iter()
-                .map(|x| substitute_partition_name(x, alias, partition_name))
-                .collect(),
-        ),
-        Expr::FieldSetCompare { base, items, op, rhs } => Expr::FieldSetCompare {
-            base: base.clone(),
-            items: items.clone(),
-            op: *op,
-            rhs: Box::new(substitute_partition_name(rhs, alias, partition_name)),
-        },
-        Expr::Compare(l, op, r) => Expr::Compare(
-            Box::new(substitute_partition_name(l, alias, partition_name)),
-            *op,
-            Box::new(substitute_partition_name(r, alias, partition_name)),
-        ),
-        Expr::In(l, r) => Expr::In(
-            Box::new(substitute_partition_name(l, alias, partition_name)),
-            Box::new(substitute_partition_name(r, alias, partition_name)),
-        ),
-        Expr::NotIn(l, r) => Expr::NotIn(
-            Box::new(substitute_partition_name(l, alias, partition_name)),
-            Box::new(substitute_partition_name(r, alias, partition_name)),
-        ),
-        Expr::And(l, r) => Expr::And(
-            Box::new(substitute_partition_name(l, alias, partition_name)),
-            Box::new(substitute_partition_name(r, alias, partition_name)),
-        ),
-        Expr::Or(l, r) => Expr::Or(
-            Box::new(substitute_partition_name(l, alias, partition_name)),
-            Box::new(substitute_partition_name(r, alias, partition_name)),
-        ),
-        Expr::Not(i) => Expr::Not(Box::new(substitute_partition_name(i, alias, partition_name))),
-        Expr::Exists(i) => Expr::Exists(Box::new(substitute_partition_name(i, alias, partition_name))),
-        Expr::Neg(i) => Expr::Neg(Box::new(substitute_partition_name(i, alias, partition_name))),
-        Expr::Binary { op, lhs, rhs } => Expr::Binary {
-            op: *op,
-            lhs: Box::new(substitute_partition_name(lhs, alias, partition_name)),
-            rhs: Box::new(substitute_partition_name(rhs, alias, partition_name)),
-        },
-        Expr::Reducer { op, arg } => Expr::Reducer {
-            op: *op,
-            arg: arg
-                .as_ref()
-                .map(|a| Box::new(substitute_partition_name(a, alias, partition_name))),
-        },
-        Expr::Object(fields) => Expr::Object(
-            fields
-                .iter()
-                .map(|f| ObjectField {
-                    name: f.name.clone(),
-                    value: substitute_partition_name(&f.value, alias, partition_name),
-                    default: f
-                        .default
-                        .as_ref()
-                        .map(|d| substitute_partition_name(d, alias, partition_name)),
-                })
-                .collect(),
-        ),
-        Expr::TypeTest { value, kind, negated } => Expr::TypeTest {
-            value: Box::new(substitute_partition_name(value, alias, partition_name)),
-            kind: *kind,
-            negated: *negated,
-        },
-        Expr::Round { value, precision } => Expr::Round {
-            value: Box::new(substitute_partition_name(value, alias, partition_name)),
-            precision: precision
-                .as_ref()
-                .map(|p| Box::new(substitute_partition_name(p, alias, partition_name))),
-        },
     }
 }
 
@@ -509,73 +474,45 @@ fn lower_group(upstream: Ast, g: &GroupClause, env: &Env) -> Result<Ast, QueryEr
 
 // ===== aggregate =====
 
-fn lower_aggregate(
-    upstream: Ast,
-    agg: &AggregateShorthand,
-    env: &Env,
-) -> Result<Ast, QueryError> {
-    let reducer_node = match agg.op {
-        AggOp::Sum => Ast::Sum,
-        AggOp::Count => Ast::Count,
-        AggOp::Avg => Ast::Avg,
-        AggOp::Min => Ast::Min,
-        AggOp::Max => Ast::Max,
-    };
-    let reducer_expr = match (&agg.arg, agg.op) {
-        (Some(e), _) => {
-            let value = lower_expr(e, env)?;
-            pipe(value, reducer_node.clone())
-        }
-        (None, AggOp::Count) => reducer_node.clone(),
-        (None, _) => {
-            return Err(QueryError::new(
-                0,
-                "this aggregate requires a value expression".into(),
-            ));
-        }
-    };
-
-    let key_ast = match agg.group_by.len() {
-        0 => {
-            return Ok(match &agg.arg {
-                Some(e) => {
-                    let value = lower_expr(e, env)?;
-                    let with_value = pipe(upstream, value);
-                    pipe(with_value, reducer_node)
-                }
-                None => pipe(upstream, reducer_node),
-            });
-        }
-        1 => lower_expr(&agg.group_by[0], env)?,
-        _ => {
-            let mut parts = Vec::with_capacity(agg.group_by.len());
-            for k in &agg.group_by {
-                parts.push(lower_expr(k, env)?);
-            }
-            Ast::KeyTuple(parts)
-        }
-    };
-
-    Ok(pipe(
-        upstream,
-        Ast::By(Box::new(reducer_expr), Box::new(key_ast)),
-    ))
-}
-
 fn lower_aggregate_block(
     upstream: Ast,
     block: &AggregateBlock,
     env: &Env,
 ) -> Result<Ast, QueryError> {
-    let group = if let Some(group_by) = &block.group_by {
-        let name = group_key_label(group_by).unwrap_or_else(|| "key".to_string());
-        let key = lower_expr(group_by, env)?;
-        Some(super::super::ast::AggGroup {
-            name,
-            key: Box::new(key),
-        })
+    use super::super::ast::{AggGroup, AggGroupKey};
+    let group = if block.rollup {
+        let mut keys = Vec::with_capacity(block.group_by.len());
+        for (i, k) in block.group_by.iter().enumerate() {
+            let name = group_key_label(k).unwrap_or_else(|| format!("key{}", i + 1));
+            keys.push(AggGroupKey {
+                name,
+                key: Box::new(lower_expr(k, env)?),
+            });
+        }
+        Some(AggGroup::Rollup(keys))
     } else {
-        None
+        match block.group_by.as_slice() {
+            [] => None,
+            [single] => {
+                let name = group_key_label(single).unwrap_or_else(|| "key".to_string());
+                let key = lower_expr(single, env)?;
+                Some(AggGroup::Single {
+                    name,
+                    key: Box::new(key),
+                })
+            }
+            many => {
+                let mut parts = Vec::with_capacity(many.len());
+                for k in many {
+                    parts.push(lower_expr(k, env)?);
+                }
+                let name = group_key_label(&many[0]).unwrap_or_else(|| "key".to_string());
+                Some(AggGroup::Single {
+                    name,
+                    key: Box::new(Ast::KeyTuple(parts)),
+                })
+            }
+        }
     };
 
     let mut reductions: Vec<AggReduction> = Vec::new();
@@ -707,6 +644,7 @@ fn preprocess_alias_lets(
     Ok(AggregateBlock {
         reductions: substituted,
         group_by: block.group_by.clone(),
+        rollup: block.rollup,
     })
 }
 
@@ -727,7 +665,7 @@ fn substitute_aliases(e: &Expr, aliases: &HashMap<String, Expr>) -> Expr {
             }
             Expr::Path(p.clone())
         }
-        Expr::Lit(_) => e.clone(),
+        Expr::Lit(_) | Expr::Param(_) => e.clone(),
         Expr::Array(items) => Expr::Array(
             items.iter().map(|x| substitute_aliases(x, aliases)).collect(),
         ),
@@ -790,12 +728,19 @@ fn substitute_aliases(e: &Expr, aliases: &HashMap<String, Expr>) -> Expr {
             kind: *kind,
             negated: *negated,
         },
-        Expr::Round { value, precision } => Expr::Round {
-            value: Box::new(substitute_aliases(value, aliases)),
-            precision: precision
-                .as_ref()
-                .map(|p| Box::new(substitute_aliases(p, aliases))),
+        Expr::Call(name, args) => Expr::Call(
+            name.clone(),
+            args.iter().map(|a| substitute_aliases(a, aliases)).collect(),
+        ),
+        Expr::If { cond, then_branch, else_branch } => Expr::If {
+            cond: Box::new(substitute_aliases(cond, aliases)),
+            then_branch: Box::new(substitute_aliases(then_branch, aliases)),
+            else_branch: Box::new(substitute_aliases(else_branch, aliases)),
         },
+        // Aggregate-`let` substitution doesn't descend into a subquery:
+        // the inner query has its own scope and resolves aliases at its
+        // own lowering time, so the macro names don't apply inside it.
+        Expr::Subquery(_) => e.clone(),
     }
 }
 
@@ -842,15 +787,50 @@ fn lower_output_expr(
             let i = lower_output_expr(inner, reductions, where_pred_ast, item_name, env)?;
             Ok(Ast::Neg(Box::new(i)))
         }
-        Expr::Round { value, precision } => {
-            let v = lower_output_expr(value, reductions, where_pred_ast, item_name, env)?;
-            let p = match precision {
-                Some(e) => Some(Box::new(lower_output_expr(
-                    e, reductions, where_pred_ast, item_name, env,
-                )?)),
-                None => None,
-            };
-            Ok(Ast::Round { value: Box::new(v), precision: p })
+        Expr::Call(name, args) => {
+            // Recurse into every argument so reducer calls nested in a
+            // function (e.g. `round(sum(.x))`) hoist into the surrounding
+            // aggregate block's reduction list.
+            let lowered = args
+                .iter()
+                .map(|a| lower_output_expr(a, reductions, where_pred_ast, item_name, env))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Ast::Call { name: name.clone(), args: lowered })
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            // Recurse into all three arms so reducer calls anywhere in
+            // the conditional hoist into the surrounding aggregate
+            // block's reduction list.
+            let c = lower_output_expr(cond, reductions, where_pred_ast, item_name, env)?;
+            let t = lower_output_expr(then_branch, reductions, where_pred_ast, item_name, env)?;
+            let el = lower_output_expr(else_branch, reductions, where_pred_ast, item_name, env)?;
+            Ok(Ast::If {
+                cond: Box::new(c),
+                then_branch: Box::new(t),
+                else_branch: Box::new(el),
+            })
+        }
+        // Boolean / comparison wrappers can carry reducer calls when
+        // they appear as a sub-expression of an `if(...)` arm. Recurse
+        // through them so the hoist reaches the embedded reducers.
+        Expr::Compare(l, op, r) => {
+            let la = lower_output_expr(l, reductions, where_pred_ast, item_name, env)?;
+            let ra = lower_output_expr(r, reductions, where_pred_ast, item_name, env)?;
+            Ok(Ast::Compare(Box::new(la), *op, Box::new(ra)))
+        }
+        Expr::And(l, r) => {
+            let la = lower_output_expr(l, reductions, where_pred_ast, item_name, env)?;
+            let ra = lower_output_expr(r, reductions, where_pred_ast, item_name, env)?;
+            Ok(Ast::And(Box::new(la), Box::new(ra)))
+        }
+        Expr::Or(l, r) => {
+            let la = lower_output_expr(l, reductions, where_pred_ast, item_name, env)?;
+            let ra = lower_output_expr(r, reductions, where_pred_ast, item_name, env)?;
+            Ok(Ast::Or(Box::new(la), Box::new(ra)))
+        }
+        Expr::Not(inner) => {
+            let i = lower_output_expr(inner, reductions, where_pred_ast, item_name, env)?;
+            Ok(pipe(i, Ast::Not))
         }
         _ => lower_expr(e, env),
     }
@@ -902,10 +882,20 @@ fn lower_expr(e: &Expr, env: &Env) -> Result<Ast, QueryError> {
     match e {
         Expr::Path(p) => lower_path(p, env),
         Expr::Lit(l) => Ok(lower_lit(l)),
-        Expr::Array(_) => Err(QueryError::new(
-            0,
-            "array literals are only supported as the right-hand side of `in` / `not in`".into(),
-        )),
+        Expr::Param(name) => match env.params.get(name) {
+            Some(v) => Ok(param_to_ast(v)),
+            None => Err(QueryError::new(
+                0,
+                format!("undefined query parameter `${}`", name),
+            )),
+        },
+        Expr::Array(items) => {
+            let lowered = items
+                .iter()
+                .map(|x| lower_expr(x, env))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Ast::ArrayLit(lowered))
+        }
         Expr::FieldSetCompare { base, items, op, rhs } => {
             lower_field_set_compare(base, items, *op, rhs, env)
         }
@@ -916,6 +906,10 @@ fn lower_expr(e: &Expr, env: &Env) -> Result<Ast, QueryError> {
         }
         Expr::In(l, r) => lower_in(l, r, false, env),
         Expr::NotIn(l, r) => lower_in(l, r, true, env),
+        Expr::Subquery(q) => {
+            let pipeline = lower_query_scoped(q, &env.params, &env.aliases)?;
+            Ok(Ast::Subquery { pipeline: Box::new(pipeline) })
+        }
         Expr::And(l, r) => {
             let la = lower_expr(l, env)?;
             let ra = lower_expr(r, env)?;
@@ -955,13 +949,22 @@ fn lower_expr(e: &Expr, env: &Env) -> Result<Ast, QueryError> {
                 negated: *negated,
             })
         }
-        Expr::Round { value, precision } => {
-            let v = lower_expr(value, env)?;
-            let p = match precision {
-                Some(e) => Some(Box::new(lower_expr(e, env)?)),
-                None => None,
-            };
-            Ok(Ast::Round { value: Box::new(v), precision: p })
+        Expr::Call(name, args) => {
+            let lowered = args
+                .iter()
+                .map(|a| lower_expr(a, env))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Ast::Call { name: name.clone(), args: lowered })
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            let c = lower_expr(cond, env)?;
+            let t = lower_expr(then_branch, env)?;
+            let e = lower_expr(else_branch, env)?;
+            Ok(Ast::If {
+                cond: Box::new(c),
+                then_branch: Box::new(t),
+                else_branch: Box::new(e),
+            })
         }
         Expr::Reducer { .. } => Err(QueryError::new(
             0,
@@ -1071,12 +1074,34 @@ fn lower_field_set_compare(
 }
 
 fn lower_in(lhs: &Expr, rhs: &Expr, negated: bool, env: &Env) -> Result<Ast, QueryError> {
+    // `x in (SUBQUERY)` — membership over the subquery's emission stream.
+    // Lowers to "does the subquery emit any row equal to x?": run the
+    // inner pipeline, keep only emissions equal to the (outer-correlated)
+    // lhs, and test for existence. `not in` negates the existence test.
+    if let Expr::Subquery(q) = rhs {
+        let lhs_ast = lower_expr(lhs, env)?;
+        let pipeline = lower_query_scoped(q, &env.params, &env.aliases)?;
+        let member = pipe(
+            Ast::Subquery { pipeline: Box::new(pipeline) },
+            Ast::Select(Box::new(Ast::Compare(
+                Box::new(Ast::Identity),
+                CompareOp::Eq,
+                Box::new(lhs_ast),
+            ))),
+        );
+        let exists = Ast::Exists(Box::new(member));
+        return Ok(if negated {
+            pipe(exists, Ast::Not)
+        } else {
+            exists
+        });
+    }
     let items = match rhs {
         Expr::Array(xs) => xs,
         _ => {
             return Err(QueryError::new(
                 0,
-                "right-hand side of `in` must be an array literal".into(),
+                "right-hand side of `in` must be an array literal or a subquery".into(),
             ));
         }
     };
@@ -1109,6 +1134,7 @@ pub fn lower_path_only(p: &PathExpr) -> Result<Ast, QueryError> {
     let env = Env {
         aliases: std::collections::HashSet::new(),
         lets: HashMap::new(),
+        params: HashMap::new(),
     };
     lower_path(p, &env)
 }
@@ -1164,100 +1190,6 @@ fn pipe(l: Ast, r: Ast) -> Ast {
         }
     }
     Ast::Pipe(Box::new(l), Box::new(r))
-}
-
-// ===== order-by bare-name rewrite =====
-
-/// Walks an `order by` expression and rewrites every `Path { root:
-/// Name(n) }` whose `n` isn't a known alias into an Identity-rooted
-/// Field path. Lets users write `order by weight` against a select
-/// projection's `weight` field without spelling out `.weight`.
-fn rewrite_for_order_by(e: &Expr, env: &Env) -> Expr {
-    match e {
-        Expr::Path(p) => Expr::Path(rewrite_path_for_order_by(p, env)),
-        Expr::Lit(_) => e.clone(),
-        Expr::Array(items) => Expr::Array(
-            items.iter().map(|x| rewrite_for_order_by(x, env)).collect(),
-        ),
-        Expr::FieldSetCompare { base, items, op, rhs } => Expr::FieldSetCompare {
-            base: rewrite_path_for_order_by(base, env),
-            items: items.clone(),
-            op: *op,
-            rhs: Box::new(rewrite_for_order_by(rhs, env)),
-        },
-        Expr::Compare(l, op, r) => Expr::Compare(
-            Box::new(rewrite_for_order_by(l, env)),
-            *op,
-            Box::new(rewrite_for_order_by(r, env)),
-        ),
-        Expr::In(l, r) => Expr::In(
-            Box::new(rewrite_for_order_by(l, env)),
-            Box::new(rewrite_for_order_by(r, env)),
-        ),
-        Expr::NotIn(l, r) => Expr::NotIn(
-            Box::new(rewrite_for_order_by(l, env)),
-            Box::new(rewrite_for_order_by(r, env)),
-        ),
-        Expr::And(l, r) => Expr::And(
-            Box::new(rewrite_for_order_by(l, env)),
-            Box::new(rewrite_for_order_by(r, env)),
-        ),
-        Expr::Or(l, r) => Expr::Or(
-            Box::new(rewrite_for_order_by(l, env)),
-            Box::new(rewrite_for_order_by(r, env)),
-        ),
-        Expr::Not(inner) => Expr::Not(Box::new(rewrite_for_order_by(inner, env))),
-        Expr::Exists(inner) => Expr::Exists(Box::new(rewrite_for_order_by(inner, env))),
-        Expr::Binary { op, lhs, rhs } => Expr::Binary {
-            op: *op,
-            lhs: Box::new(rewrite_for_order_by(lhs, env)),
-            rhs: Box::new(rewrite_for_order_by(rhs, env)),
-        },
-        Expr::Neg(inner) => Expr::Neg(Box::new(rewrite_for_order_by(inner, env))),
-        Expr::Reducer { op, arg } => Expr::Reducer {
-            op: *op,
-            arg: arg.as_ref().map(|a| Box::new(rewrite_for_order_by(a, env))),
-        },
-        Expr::Object(fields) => Expr::Object(
-            fields
-                .iter()
-                .map(|f| ObjectField {
-                    name: f.name.clone(),
-                    value: rewrite_for_order_by(&f.value, env),
-                    default: f
-                        .default
-                        .as_ref()
-                        .map(|d| rewrite_for_order_by(d, env)),
-                })
-                .collect(),
-        ),
-        Expr::TypeTest { value, kind, negated } => Expr::TypeTest {
-            value: Box::new(rewrite_for_order_by(value, env)),
-            kind: *kind,
-            negated: *negated,
-        },
-        Expr::Round { value, precision } => Expr::Round {
-            value: Box::new(rewrite_for_order_by(value, env)),
-            precision: precision
-                .as_ref()
-                .map(|p| Box::new(rewrite_for_order_by(p, env))),
-        },
-    }
-}
-
-fn rewrite_path_for_order_by(p: &PathExpr, env: &Env) -> PathExpr {
-    match &p.root {
-        PathRoot::Name(name) if !env.aliases.contains(name) => {
-            let mut segments = Vec::with_capacity(p.segments.len() + 1);
-            segments.push(PathSeg::Field(name.clone()));
-            segments.extend(p.segments.iter().cloned());
-            PathExpr {
-                root: PathRoot::Identity,
-                segments,
-            }
-        }
-        _ => p.clone(),
-    }
 }
 
 // ===== predicate reorder =====
@@ -1339,6 +1271,12 @@ fn predicate_cost(ast: &Ast) -> u64 {
         Ast::Lookup { source, key, .. } => {
             30u64.saturating_add(predicate_cost(source)).saturating_add(predicate_cost(key))
         }
+        Ast::JoinEach { outer_key, lookup, .. } => {
+            30u64.saturating_add(predicate_cost(outer_key)).saturating_add(predicate_cost(lookup))
+        }
+        Ast::UnnestEach { source, .. } => {
+            20u64.saturating_add(predicate_cost(source))
+        }
         Ast::FieldSetEquals { base, fields, target } => predicate_cost(base)
             .saturating_add(predicate_cost(target))
             .saturating_add(20)
@@ -1349,7 +1287,7 @@ fn predicate_cost(ast: &Ast) -> u64 {
         Ast::SortBy(_) => 500,
         Ast::AggregateBlock { .. } => 1000,
         Ast::Project(fields) => fields.iter().map(|(_, a)| predicate_cost(a)).sum::<u64>().saturating_add(5),
-        Ast::KeyTuple(parts) => parts.iter().map(predicate_cost).sum(),
+        Ast::KeyTuple(parts) | Ast::ArrayLit(parts) => parts.iter().map(predicate_cost).sum(),
         Ast::Binary { lhs, rhs, .. } => 1u64
             .saturating_add(predicate_cost(lhs))
             .saturating_add(predicate_cost(rhs)),
@@ -1361,8 +1299,20 @@ fn predicate_cost(ast: &Ast) -> u64 {
             .sum::<u64>()
             .saturating_add(5),
         Ast::TypeTest { value, .. } => 1u64.saturating_add(predicate_cost(value)),
-        Ast::Round { value, precision } => 2u64
-            .saturating_add(predicate_cost(value))
-            .saturating_add(precision.as_ref().map(|p| predicate_cost(p)).unwrap_or(0)),
+        Ast::Call { args, .. } => args
+            .iter()
+            .map(predicate_cost)
+            .fold(2u64, |acc, c| acc.saturating_add(c)),
+        Ast::If { cond, then_branch, else_branch } => 2u64
+            .saturating_add(predicate_cost(cond))
+            // Take the cheaper of the two branches — at runtime only one
+            // is walked, so an expensive `else` arm shouldn't push a
+            // predicate to the back of the chain if `then` is cheap.
+            .saturating_add(predicate_cost(then_branch).min(predicate_cost(else_branch))),
+        // A correlated subquery re-runs an entire inner pipeline per outer
+        // row — the most expensive thing a predicate can do. Cost it above
+        // an aggregate so `where` reordering pushes it to the back, after
+        // every cheaper filter has had a chance to drop the row.
+        Ast::Subquery { pipeline } => 2000u64.saturating_add(predicate_cost(pipeline)),
     }
 }

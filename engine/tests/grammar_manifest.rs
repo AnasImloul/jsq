@@ -16,16 +16,19 @@ fn all_parser_keywords_present_in_manifest() {
     use engine::query::grammar::kw;
 
     let expected = [
-        kw::FROM, kw::JOIN, kw::AS, kw::ON,
-        kw::LET, kw::WHERE, kw::PARTITION, kw::AGGREGATE, kw::EACH,
-        kw::SELECT, kw::ORDER, kw::LIMIT,
-        kw::BY, kw::GROUP, kw::ASC, kw::DESC,
+        kw::FROM, kw::FIELDS, kw::JOIN, kw::INNER, kw::LEFT, kw::AS, kw::ON, kw::UNNEST,
+        kw::LET, kw::WHERE, kw::AGGREGATE, kw::COLLECT,
+        kw::HAVING, kw::SELECT, kw::ORDER, kw::LIMIT,
+        kw::BY, kw::ROLLUP, kw::ASC, kw::DESC,
         kw::AND, kw::OR, kw::NOT,
         kw::IN, kw::EXISTS, kw::IS,
         kw::MATCHES, kw::STARTS_WITH, kw::ENDS_WITH, kw::CONTAINS,
         kw::SUM, kw::COUNT, kw::AVG, kw::MIN, kw::MAX,
         kw::TRUE, kw::FALSE, kw::NULL,
         kw::ROUND,
+        kw::IF,
+        kw::LENGTH, kw::LOWER, kw::UPPER, kw::ABS, kw::FLOOR, kw::CEIL,
+        kw::SQRT, kw::POW, kw::MOD, kw::TRIM, kw::SUBSTR, kw::REPLACE,
         kw::DISTINCT,
     ];
     for word in expected {
@@ -48,16 +51,19 @@ fn no_orphaned_manifest_entries() {
     use engine::query::grammar::kw;
 
     let live: &[&str] = &[
-        kw::FROM, kw::JOIN, kw::AS, kw::ON,
-        kw::LET, kw::WHERE, kw::PARTITION, kw::AGGREGATE, kw::EACH,
-        kw::SELECT, kw::ORDER, kw::LIMIT,
-        kw::BY, kw::GROUP, kw::ASC, kw::DESC,
+        kw::FROM, kw::FIELDS, kw::JOIN, kw::INNER, kw::LEFT, kw::AS, kw::ON, kw::UNNEST,
+        kw::LET, kw::WHERE, kw::AGGREGATE, kw::COLLECT,
+        kw::HAVING, kw::SELECT, kw::ORDER, kw::LIMIT,
+        kw::BY, kw::ROLLUP, kw::ASC, kw::DESC,
         kw::AND, kw::OR, kw::NOT,
         kw::IN, kw::EXISTS, kw::IS,
         kw::MATCHES, kw::STARTS_WITH, kw::ENDS_WITH, kw::CONTAINS,
         kw::SUM, kw::COUNT, kw::AVG, kw::MIN, kw::MAX,
         kw::TRUE, kw::FALSE, kw::NULL,
         kw::ROUND,
+        kw::IF,
+        kw::LENGTH, kw::LOWER, kw::UPPER, kw::ABS, kw::FLOOR, kw::CEIL,
+        kw::SQRT, kw::POW, kw::MOD, kw::TRIM, kw::SUBSTR, kw::REPLACE,
         kw::DISTINCT,
     ];
     for k in KEYWORDS {
@@ -141,7 +147,6 @@ fn punctuation_lists_every_lexer_kind() {
         PunctKind::Question, PunctKind::QuestionQuestion,
         PunctKind::LParen, PunctKind::RParen,
         PunctKind::Star, PunctKind::StarStar,
-        PunctKind::FatArrow,
     ];
     for kind in kinds {
         assert!(
@@ -158,15 +163,18 @@ fn role_filters_match_existing_swift_lists() {
     // AutocompleteContext hard-codes. If you intentionally narrow or
     // widen the set, update both lists below.
     let value_start_expected = [
-        "from", "not", "null", "true", "false",
+        "from", "fields", "not", "null", "true", "false",
         "sum", "count", "avg", "min", "max",
+        "round", "if",
+        "length", "lower", "upper", "abs", "floor", "ceil",
+        "sqrt", "pow", "mod", "trim", "substr", "replace",
     ];
     let after_expression_expected = [
-        "and", "or", "by",
+        "and", "or", "by", "rollup",
         "where", "let", "order", "limit",
-        "join", "on", "as",
-        "partition", "aggregate", "each",
-        "select", "group",
+        "join", "inner", "left", "on", "as", "unnest",
+        "aggregate", "collect",
+        "having", "select",
         "in", "exists", "matches", "starts_with", "ends_with", "contains",
         "asc", "desc",
         "distinct",

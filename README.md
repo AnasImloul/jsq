@@ -22,7 +22,7 @@ scripts/   Shared build helpers (build-engine.sh, release.sh).
 ```sh
 # CLI
 cd engine && cargo install --path .
-jsq path/to/file.json 'from .events[*] as e count'
+jsq path/to/file.json 'from .events[] as e aggregate { n: count() }'
 
 # macOS app
 open app/BigJSON.xcodeproj          # then ⌘R, or:

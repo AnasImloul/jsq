@@ -110,6 +110,17 @@ pub(super) fn write_fingerprint(doc: &Document, v: &Value, out: &mut Vec<u8>) {
             }
             out.push(b'}');
         }
+        Value::Array(items) => {
+            out.push(b'A');
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_fingerprint(doc, item, out);
+            }
+            out.push(b']');
+        }
         Value::NamedValue { name, value } => {
             out.push(b'V');
             out.push(b'{');

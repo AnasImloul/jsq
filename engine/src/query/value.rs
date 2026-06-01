@@ -45,6 +45,9 @@ pub enum Value {
     /// surfaces `name` as the row's path and the inner value's JSON
     /// in the value column.
     NamedValue { name: String, value: Box<Value> },
+    /// Synthetic JSON array produced by surface array construction
+    /// `[e1, e2, ...]`. Holds the materialised element values in order.
+    Array(Vec<Value>),
 }
 
 impl Value {
@@ -59,6 +62,8 @@ impl Value {
             Value::Group { n, .. } => n.is_some(),
             Value::GroupList { members, .. } => !members.is_empty(),
             Value::Object(fields) | Value::BucketRow(fields) => !fields.is_empty(),
+            // jq treats every array — including `[]` — as truthy.
+            Value::Array(_) => true,
             Value::NamedValue { value, .. } => value.is_truthy(doc),
             Value::Node(id) => match doc.node_kind(*id) {
                 crate::document::NodeKind::Null => false,
@@ -103,7 +108,7 @@ impl Scalar {
             // containers — equality is by identity (always unequal here
             // since we use 0 for all). Refine if/when projections feed
             // into comparisons in a meaningful way.
-            Value::Object(_) | Value::BucketRow(_) | Value::NamedValue { .. } => Scalar::Container(0),
+            Value::Object(_) | Value::BucketRow(_) | Value::NamedValue { .. } | Value::Array(_) => Scalar::Container(0),
             Value::Node(id) => match doc.node_kind(*id) {
                 NodeKind::Null => Scalar::Null,
                 NodeKind::Bool => Scalar::Bool(matches!(doc.value_bytes(*id), Some(b"true"))),

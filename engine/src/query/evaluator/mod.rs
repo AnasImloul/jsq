@@ -34,8 +34,9 @@ use super::value::Value;
 mod aggregate;
 mod compare;
 mod fingerprint;
+mod functions;
 mod reducers;
-mod render;
+pub mod render;
 mod scan;
 mod sort;
 mod walk;
@@ -89,6 +90,15 @@ thread_local! {
     /// it afterwards, so nested aggregates (when they arrive) keep
     /// separate slot frames without cross-talk.
     static REDUCER_SLOTS: RefCell<Vec<Vec<Option<f64>>>> = const { RefCell::new(Vec::new()) };
+
+    /// Document root node id for the current `run`. Read by the
+    /// `Ast::Subquery` arm: a correlated subquery evaluates against the
+    /// document root (with the outer row's aliases still bound) rather
+    /// than against the current pipeline input. Set at the top of `run`
+    /// and left at 0 otherwise — 0 is the conventional root, which is
+    /// also what `collect_kinds` / `collect_keys` seed, so those paths
+    /// see a consistent root.
+    static DOC_ROOT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 
     /// Resolved foreign-key indexes for every `Ast::Lookup` reachable
     /// from the query root. Populated once at the top of `run` while
@@ -182,6 +192,10 @@ pub(super) fn pop_reducer_slots() {
     });
 }
 
+pub(super) fn doc_root() -> u32 {
+    DOC_ROOT.with(|c| c.get())
+}
+
 pub(super) fn reducer_slot_value(i: usize) -> Option<f64> {
     REDUCER_SLOTS.with(|s| {
         let stack = s.borrow();
@@ -241,18 +255,52 @@ pub(super) fn lookup_resolved<'a>(canon_key: usize) -> ResolvedIndex<'a> {
     }
 }
 
-/// Walks the AST and, for every `Ast::Lookup` it finds, records that
-/// node's `(source_canon, key_canon)` strings. The `usize` in each
-/// tuple is `source_canon.as_ptr() as usize` — the cache key the
-/// `Lookup` arm will use at evaluation time.
-fn collect_lookups<'a>(
+/// Builds and registers a foreign-key index for every `Ast::Lookup`
+/// reachable from `ast` that isn't already in the registry.
+///
+/// The Swift app builds indexes explicitly over FFI and reuses them
+/// across many queries against the same document; the `jsq` CLI runs a
+/// single query and exits, so it calls this once to make joins work
+/// without a separate build step. Deduplicates by canonical
+/// `(source, key)` so repeated joins on the same key build once, and
+/// skips any pair already present so a caller that pre-built some
+/// indexes keeps them.
+pub fn build_indexes(doc: &Document, ast: &super::ast::Ast) {
+    let mut nodes: Vec<&super::ast::Ast> = Vec::new();
+    collect_lookups(ast, &mut nodes);
+    let mut built: HashSet<(String, String)> = HashSet::new();
+    for node in nodes {
+        let super::ast::Ast::Lookup { source, key, source_canon, key_canon } = node else {
+            continue;
+        };
+        if !built.insert((source_canon.clone(), key_canon.clone())) {
+            continue;
+        }
+        if let Ok(reg) = doc.indexes.lock() {
+            if reg.get(source_canon, key_canon).is_some() {
+                continue;
+            }
+        }
+        let index = ForeignKeyIndex::build(doc, source, key);
+        if let Ok(mut reg) = doc.indexes.lock() {
+            reg.insert(source_canon.clone(), key_canon.clone(), index);
+        }
+    }
+}
+
+/// Walks the AST and collects every `Ast::Lookup` node it finds. Both
+/// the per-run index pre-resolution (which reads each node's
+/// `source_canon`/`key_canon`) and the CLI's index auto-build (which
+/// reads each node's `source`/`key` sub-ASTs) share this single
+/// traversal.
+pub(crate) fn collect_lookups<'a>(
     ast: &'a super::ast::Ast,
-    out: &mut Vec<(usize, &'a str, &'a str)>,
+    out: &mut Vec<&'a super::ast::Ast>,
 ) {
     use super::ast::Ast;
     match ast {
-        Ast::Lookup { source, key, source_canon, key_canon } => {
-            out.push((source_canon.as_ptr() as usize, source_canon, key_canon));
+        Ast::Lookup { source, key, .. } => {
+            out.push(ast);
             // Recurse into source/key — the surface only emits flat
             // Lookups today, but a nested one in either arm would
             // otherwise silently bypass pre-resolution and lock the
@@ -260,6 +308,16 @@ fn collect_lookups<'a>(
             collect_lookups(source, out);
             collect_lookups(key, out);
         }
+        Ast::JoinEach { outer_key, lookup, .. } => {
+            collect_lookups(outer_key, out);
+            collect_lookups(lookup, out);
+        }
+        Ast::UnnestEach { source, .. } => collect_lookups(source, out),
+        // Recurse into the subquery's pipeline so any join/lookup inside
+        // a correlated subquery is pre-resolved (and CLI auto-built) just
+        // like one in the outer query — otherwise it would lock the index
+        // registry per outer row, or fail to build at all under `jsq`.
+        Ast::Subquery { pipeline } => collect_lookups(pipeline, out),
         Ast::Pipe(l, r)
         | Ast::And(l, r)
         | Ast::Or(l, r)
@@ -286,14 +344,20 @@ fn collect_lookups<'a>(
                 collect_lookups(k, out);
             }
         }
-        Ast::KeyTuple(parts) => {
+        Ast::KeyTuple(parts) | Ast::ArrayLit(parts) => {
             for p in parts {
                 collect_lookups(p, out);
             }
         }
         Ast::AggregateBlock { group, reductions, outputs } => {
-            if let Some(g) = group {
-                collect_lookups(&g.key, out);
+            match group {
+                Some(super::ast::AggGroup::Single { key, .. }) => collect_lookups(key, out),
+                Some(super::ast::AggGroup::Rollup(keys)) => {
+                    for k in keys {
+                        collect_lookups(&k.key, out);
+                    }
+                }
+                None => {}
             }
             for r in reductions {
                 if let Some(v) = &r.value {
@@ -318,11 +382,15 @@ fn collect_lookups<'a>(
             }
         }
         Ast::TypeTest { value, .. } => collect_lookups(value, out),
-        Ast::Round { value, precision } => {
-            collect_lookups(value, out);
-            if let Some(p) = precision {
-                collect_lookups(p, out);
+        Ast::Call { args, .. } => {
+            for a in args {
+                collect_lookups(a, out);
             }
+        }
+        Ast::If { cond, then_branch, else_branch } => {
+            collect_lookups(cond, out);
+            collect_lookups(then_branch, out);
+            collect_lookups(else_branch, out);
         }
         // Leaves with no nested expressions.
         Ast::Identity
@@ -351,7 +419,7 @@ fn collect_lookups<'a>(
 
 fn collect_lookups_in_agg_output<'a>(
     node: &'a super::ast::AggOutputNode,
-    out: &mut Vec<(usize, &'a str, &'a str)>,
+    out: &mut Vec<&'a super::ast::Ast>,
 ) {
     match node {
         super::ast::AggOutputNode::Leaf { expr, default } => {
@@ -368,15 +436,17 @@ fn collect_lookups_in_agg_output<'a>(
     }
 }
 
-/// Result row crossed back to FFI / Swift. Owned strings — typical query
-/// caps at 5000 results, so total result-side memory is ~MB-scale.
+/// Result row crossed back to FFI / Swift. Carries the row's value
+/// directly; presentation strings (preview, full JSON) are derived on
+/// demand by the renderer or the FFI marshalling layer. `kind` and
+/// `path` are cached because both consumers (CSV type column, Swift
+/// table view) read them per-row and recomputing the path means
+/// re-walking the ancestor chain.
 #[derive(Clone, Debug)]
 pub struct QueryResult {
-    pub node_id: u32, // NULL_NODE for synthetic
-    pub kind: u8,    // ENGINE_KIND_*
+    pub kind: u8, // ENGINE_KIND_*
     pub path: String,
-    pub preview: String,
-    pub full_text: String,
+    pub value: super::value::Value,
 }
 
 #[derive(Debug)]
@@ -412,6 +482,7 @@ pub fn run(doc: &Document, ast: &super::ast::Ast, root: u32, limit: usize) -> Ev
     reset_bindings();
     reset_reducer_slots();
     OUTER_LIMIT.with(|c| c.set(limit));
+    DOC_ROOT.with(|c| c.set(root));
 
     // Pre-resolve every Ast::Lookup against the registry once, while
     // we hold the document's index mutex. The Lookup arm then reads a
@@ -419,7 +490,7 @@ pub fn run(doc: &Document, ast: &super::ast::Ast, root: u32, limit: usize) -> Ev
     // no per-call canonical-string HashMap fetch. The mutex guard is
     // held until we clear `LOOKUP_RESOLVED` below, so all stored
     // pointers remain valid for the duration of the walk.
-    let mut lookup_refs: Vec<(usize, &str, &str)> = Vec::new();
+    let mut lookup_refs: Vec<&super::ast::Ast> = Vec::new();
     collect_lookups(ast, &mut lookup_refs);
     let _registry_guard = if lookup_refs.is_empty() {
         None
@@ -428,12 +499,15 @@ pub fn run(doc: &Document, ast: &super::ast::Ast, root: u32, limit: usize) -> Ev
             Ok(g) => {
                 let mut resolved: HashMap<usize, usize> =
                     HashMap::with_capacity(lookup_refs.len());
-                for (key, source, key_str) in &lookup_refs {
-                    let p = match g.get(source, key_str) {
+                for node in &lookup_refs {
+                    let super::ast::Ast::Lookup { source_canon, key_canon, .. } = node else {
+                        continue;
+                    };
+                    let p = match g.get(source_canon, key_canon) {
                         Some(idx) => idx as *const ForeignKeyIndex as usize,
                         None => 0, // negative cache — Lookup arm raises MissingIndex
                     };
-                    resolved.insert(*key, p);
+                    resolved.insert(source_canon.as_ptr() as usize, p);
                 }
                 LOOKUP_RESOLVED.with(|r| *r.borrow_mut() = resolved);
                 Some(g)
@@ -461,6 +535,7 @@ pub fn run(doc: &Document, ast: &super::ast::Ast, root: u32, limit: usize) -> Ev
     drop(_registry_guard);
 
     OUTER_LIMIT.with(|c| c.set(0));
+    DOC_ROOT.with(|c| c.set(0));
     let error = take_eval_error();
     let scanned_rows = take_scanned_rows();
     let scanned_bytes = take_scanned_bytes();
@@ -500,7 +575,7 @@ pub fn collect_kinds(doc: &Document, ast: &super::ast::Ast, limit: usize) -> u8 
             Value::Bool(_) => NodeKind::Bool,
             Value::Number(_) | Value::Group { .. } => NodeKind::Number,
             Value::Str(_) => NodeKind::String,
-            Value::GroupList { .. } | Value::Object(_) | Value::BucketRow(_) => NodeKind::Array,
+            Value::GroupList { .. } | Value::Object(_) | Value::BucketRow(_) | Value::Array(_) => NodeKind::Array,
             Value::NamedValue { .. } => NodeKind::Object,
         };
         bitmask |= 1 << (kind as u8);

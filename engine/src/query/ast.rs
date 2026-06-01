@@ -87,6 +87,30 @@ pub enum Ast {
         key_canon: String,
     },
 
+    /// Fan-out join. Evaluates `outer_key` against the current row to get
+    /// the join key, then drives `lookup` (an `Ast::Lookup`) with it,
+    /// binding `alias` to each matched node and re-emitting the original
+    /// row once per match. When there are no matches, an `inner` join
+    /// drops the row while a left join (`inner == false`) binds `alias`
+    /// to null and emits the row once.
+    JoinEach {
+        alias: String,
+        outer_key: Box<Ast>,
+        lookup: Box<Ast>,
+        inner: bool,
+    },
+
+    /// Array fan-out. Evaluates `source` against the current row (first
+    /// emission wins) and, when it is an array, binds `alias` to each
+    /// element in turn and re-emits the original row once per element.
+    /// A missing, empty, or non-array `source` drops the row (inner
+    /// semantics — mirrors an inner `JoinEach` with no matches). Spelled
+    /// `unnest SOURCE as ALIAS` in the surface language.
+    UnnestEach {
+        alias: String,
+        source: Box<Ast>,
+    },
+
     /// Composite group key for multi-key `by`. Evaluates each component
     /// against the current input and emits a single synthetic string
     /// formed by joining their group-key renderings with U+001F (unit
@@ -233,12 +257,50 @@ pub enum Ast {
         negated: bool,
     },
 
-    /// Numeric `round(VALUE [, PRECISION])`. Both operands collapse to
-    /// their first emission; non-numeric values produce null. When
-    /// `precision` is `None` it defaults to 0 (integer rounding).
-    Round {
-        value: Box<Ast>,
-        precision: Option<Box<Ast>>,
+    /// Strict scalar function call — `name(arg, ...)`. Every argument is
+    /// walked once and collapses to its first emission (missing emission
+    /// → null) before the function runs. Dispatched by name in the
+    /// evaluator's function table; `round`, `length`, `lower`, `abs`, …
+    /// all flow through here. The lazy `if(...)` builtin has its own
+    /// node since it must *not* evaluate both branches.
+    Call {
+        name: String,
+        args: Vec<Ast>,
+    },
+
+    /// `if(COND, THEN, ELSE)`. Walks `cond` against the current input
+    /// and inspects its first emission; if the emission is truthy
+    /// (jq rule — only `Value::Null` and `Value::Bool(false)` are
+    /// falsy; everything else, including `0` and `""`, is truthy)
+    /// the result is whatever `then_branch` emits, otherwise
+    /// `else_branch`. A `cond` that emits nothing is treated as
+    /// falsy. Both branches may emit a stream — the chosen branch's
+    /// emissions flow downstream as-is.
+    If {
+        cond: Box<Ast>,
+        then_branch: Box<Ast>,
+        else_branch: Box<Ast>,
+    },
+
+    /// Array construction — `[e1, e2, ...]`. Each element is walked once;
+    /// its first emission (or `Value::Null` if it emits nothing) becomes
+    /// the corresponding element of a synthetic `Value::Array`. Emits one
+    /// array per input value.
+    ArrayLit(Vec<Ast>),
+
+    /// Correlated subquery — a fully lowered inner pipeline that runs
+    /// against the *document root* rather than the current input, then
+    /// forwards each emission downstream. Outer `from`/`join`/`unnest`
+    /// aliases stay bound in the evaluator's binding map while the inner
+    /// pipeline runs, so a predicate like `o.cust_id == c.id` inside the
+    /// subquery resolves `c` to the current outer row. Being just a
+    /// stream-valued node, it composes with `Exists` (correlated
+    /// `exists`), `Compare`/membership (`in`), and `Project` (scalar
+    /// subquery — first emission wins) without any of those needing to
+    /// know it's a subquery. Spelled `( <full query> )` in an expression
+    /// position in the surface language.
+    Subquery {
+        pipeline: Box<Ast>,
     },
 }
 
@@ -302,7 +364,21 @@ pub enum AggOutputNode {
 }
 
 #[derive(Clone, Debug)]
-pub struct AggGroup {
+pub enum AggGroup {
+    /// Single grouping key. Covers `by k` and `by k1, k2, …` (the latter
+    /// folds into a single `Ast::KeyTuple`). One bucket per distinct key
+    /// value; the result renders with one leading key column named `name`.
+    Single { name: String, key: Box<Ast> },
+    /// `by rollup(k1, …, kN)` — hierarchical grouping. The evaluator emits
+    /// one bucket set per key prefix (`(k1…kN)`, `(k1…k(N-1))`, …, `()`),
+    /// so the stream carries full-detail rows, every subtotal level, and a
+    /// grand total. Each `AggGroupKey` becomes its own result column;
+    /// rolled-up (trailing) keys render as `null` on the subtotal rows.
+    Rollup(Vec<AggGroupKey>),
+}
+
+#[derive(Clone, Debug)]
+pub struct AggGroupKey {
     pub name: String,
     pub key: Box<Ast>,
 }
@@ -407,7 +483,7 @@ impl std::fmt::Display for Ast {
             Ast::Identity => f.write_str("."),
             Ast::Field(name) => write!(f, ".{}", json_quote(name)),
             Ast::Index(i) => write!(f, ".[{}]", i),
-            Ast::Iterate => f.write_str(".[*]"),
+            Ast::Iterate => f.write_str(".[]"),
             Ast::Pipe(l, r) => {
                 if is_chain_step(r) {
                     write!(f, "{}", l)?;
@@ -448,6 +524,19 @@ impl std::fmt::Display for Ast {
                 // but the engine still implements joins via `Ast::Lookup`
                 // — this is the debug spelling.
                 write!(f, "lookup({}; {})", source_canon, key_canon)
+            }
+            Ast::JoinEach { alias, outer_key, lookup, inner } => {
+                write!(
+                    f,
+                    "{}_join({} = {} | {})",
+                    if *inner { kw::INNER } else { kw::LEFT },
+                    json_quote(alias),
+                    outer_key,
+                    lookup
+                )
+            }
+            Ast::UnnestEach { alias, source } => {
+                write!(f, "{}({} = {})", kw::UNNEST, json_quote(alias), source)
             }
             Ast::KeyTuple(parts) => {
                 f.write_str("(")?;
@@ -502,9 +591,23 @@ impl std::fmt::Display for Ast {
             Ast::AggregateBlock { group, reductions, outputs } => {
                 f.write_str("aggregate_block(")?;
                 let mut first = true;
-                if let Some(g) = group {
-                    write!(f, "{}={}", json_quote(&g.name), g.key)?;
-                    first = false;
+                match group {
+                    Some(AggGroup::Single { name, key }) => {
+                        write!(f, "{}={}", json_quote(name), key)?;
+                        first = false;
+                    }
+                    Some(AggGroup::Rollup(keys)) => {
+                        f.write_str("rollup(")?;
+                        for (i, k) in keys.iter().enumerate() {
+                            if i > 0 {
+                                f.write_str(", ")?;
+                            }
+                            write!(f, "{}={}", json_quote(&k.name), k.key)?;
+                        }
+                        f.write_str(")")?;
+                        first = false;
+                    }
+                    None => {}
                 }
                 for r in reductions {
                     if !first { f.write_str(", ")?; } else { first = false; }
@@ -549,13 +652,26 @@ impl std::fmt::Display for Ast {
                     write!(f, "({} is {})", value, kind.keyword())
                 }
             }
-            Ast::Round { value, precision } => {
-                if let Some(p) = precision {
-                    write!(f, "round({}, {})", value, p)
-                } else {
-                    write!(f, "round({})", value)
+            Ast::Call { name, args } => {
+                write!(f, "{}(", name)?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 { f.write_str(", ")?; }
+                    write!(f, "{}", a)?;
                 }
+                f.write_str(")")
             }
+            Ast::If { cond, then_branch, else_branch } => {
+                write!(f, "if({}, {}, {})", cond, then_branch, else_branch)
+            }
+            Ast::ArrayLit(items) => {
+                f.write_str("[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 { f.write_str(", ")?; }
+                    write!(f, "{}", item)?;
+                }
+                f.write_str("]")
+            }
+            Ast::Subquery { pipeline } => write!(f, "({})", pipeline),
         }
     }
 }
@@ -592,7 +708,7 @@ fn write_chain_step(a: &Ast, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Resul
     match a {
         Ast::Field(name) => write!(f, ".{}", json_quote(name)),
         Ast::Index(i) => write!(f, "[{}]", i),
-        Ast::Iterate => f.write_str("[*]"),
+        Ast::Iterate => f.write_str("[]"),
         _ => write!(f, "{}", a),
     }
 }

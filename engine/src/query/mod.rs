@@ -34,3 +34,13 @@ impl QueryError {
 pub fn compile(source: &str) -> Result<ast::Ast, QueryError> {
     surface::compile(source)
 }
+
+/// Like [`compile`], but binds `$name` query parameters from `params`.
+pub fn compile_with_params(
+    source: &str,
+    params: &std::collections::HashMap<String, surface::ParamValue>,
+) -> Result<ast::Ast, QueryError> {
+    surface::compile_with_params(source, params)
+}
+
+pub use surface::ParamValue;

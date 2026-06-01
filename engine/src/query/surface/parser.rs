@@ -3,14 +3,13 @@
 //!
 //! Clause order (pipeline-shaped, SQL keywords):
 //!
-//!   (let NAME = { ... })*
+//!   (fields NAME = { ... })*
 //!   from PATH as ALIAS
 //!   (join PATH as ALIAS on EXPR)*
 //!   (where EXPR)?
 //!   (let NAME = EXPR (, NAME = EXPR)*)?
 //!   distinct?
-//!   (partition { NAME: PRED, ... })?
-//!   (aggregate-clause)?      // shorthand | block | group | each-partition
+//!   (aggregate-clause)?      // `aggregate { ... }` block | `collect by`
 //!   (select { NAME: EXPR, ... })?
 //!   (order by EXPR [asc|desc] (, EXPR [asc|desc])*)?
 //!   (limit N)?
@@ -20,9 +19,9 @@ use super::super::grammar::kw;
 use super::super::lexer::{tokenize, Token, TokenKind};
 use super::super::QueryError;
 use super::ast::{
-    AggBlockItem, AggOp, AggregateBlock, AggregateClause, AggregateShorthand, AliasLet, BinaryOp,
-    EachPartitionClause, Expr, FieldSetItem, GroupClause, JoinClause, JsonTypeKind, LetBinding,
-    Lit, ObjectField, OrderKey, PartitionDef, PathExpr, PathRoot, PathSeg, Query, SourceClause,
+    AggBlockItem, AggOp, AggregateBlock, AggregateClause, AliasLet, BinaryOp, Expr, FieldSetDef,
+    FieldSetItem, GroupClause, JoinClause, JoinKind, JsonTypeKind, Lit, ObjectField, OrderKey, PathExpr,
+    PathRoot, PathSeg, Query, SourceClause, UnnestClause,
 };
 
 fn op_keyword(op: AggOp) -> &'static str {
@@ -106,12 +105,19 @@ impl Parser {
         matches!(&self.peek().kind, TokenKind::Ident(s) if s == kw)
     }
 
+    /// Lookahead clamped to the trailing EOF token, so callers can peek
+    /// past the cursor without bounds-checking.
+    fn peek_at(&self, offset: usize) -> &Token {
+        let i = (self.pos + offset).min(self.tokens.len() - 1);
+        &self.tokens[i]
+    }
+
     fn parse_query(&mut self) -> Result<Query, QueryError> {
-        // Top-of-query field-set `let` bindings (compile-time only).
-        let mut lets = Vec::new();
-        while self.peek_keyword(kw::LET) && self.looks_like_field_set_let() {
+        // Top-of-query `fields NAME = { ... }` macros (compile-time only).
+        let mut field_sets = Vec::new();
+        while self.peek_keyword(kw::FIELDS) {
             self.advance();
-            lets.push(self.parse_let_binding()?);
+            field_sets.push(self.parse_field_set_def()?);
         }
 
         // `from PATH as ALIAS` — mandatory.
@@ -123,11 +129,38 @@ impl Parser {
         }
         let source = self.parse_source_clause()?;
 
-        // Zero or more joins.
+        // Zero or more joins, each optionally qualified `inner`/`left`.
         let mut joins = Vec::new();
-        while self.peek_keyword(kw::JOIN) {
-            self.advance();
-            joins.push(self.parse_join_clause()?);
+        loop {
+            let kind = if self.consume_keyword(kw::INNER) {
+                if !self.consume_keyword(kw::JOIN) {
+                    return Err(QueryError::new(
+                        self.peek().position,
+                        "expected `join` after `inner`".into(),
+                    ));
+                }
+                JoinKind::Inner
+            } else if self.consume_keyword(kw::LEFT) {
+                if !self.consume_keyword(kw::JOIN) {
+                    return Err(QueryError::new(
+                        self.peek().position,
+                        "expected `join` after `left`".into(),
+                    ));
+                }
+                JoinKind::Left
+            } else if self.consume_keyword(kw::JOIN) {
+                JoinKind::Inner
+            } else {
+                break;
+            };
+            joins.push(self.parse_join_clause(kind)?);
+        }
+
+        // Zero or more `unnest EXPR as ALIAS` clauses, applied after the
+        // joins and before `where`.
+        let mut unnests = Vec::new();
+        while self.consume_keyword(kw::UNNEST) {
+            unnests.push(self.parse_unnest_clause()?);
         }
 
         let where_clause = if self.consume_keyword(kw::WHERE) {
@@ -149,14 +182,13 @@ impl Parser {
 
         let distinct = self.consume_keyword(kw::DISTINCT);
 
-        // `partition { ... }` — declares row buckets.
-        let partitions = if self.consume_keyword(kw::PARTITION) {
-            self.parse_partition_block()?
-        } else {
-            Vec::new()
-        };
-
         let aggregate = self.parse_aggregate_clause_opt()?;
+
+        let having = if self.consume_keyword(kw::HAVING) {
+            Some(self.parse_or()?)
+        } else {
+            None
+        };
 
         let project = if self.consume_keyword(kw::SELECT) {
             Some(self.parse_select_block()?)
@@ -183,32 +215,19 @@ impl Parser {
         };
 
         Ok(Query {
-            lets,
+            field_sets,
             source,
             joins,
+            unnests,
             where_clause,
             distinct,
             alias_lets,
-            partitions,
             aggregate,
+            having,
             project,
             order_by,
             limit,
         })
-    }
-
-    /// Distinguishes a top-of-query field-set `let NAME = { ... }` from
-    /// a post-where expression `let NAME = EXPR`. Field-set form must
-    /// appear before `from`, so we peek to see whether `from` has
-    /// already been consumed: if not, this is the field-set form.
-    /// Specifically: look for `let IDENT = {`.
-    fn looks_like_field_set_let(&self) -> bool {
-        let t1 = self.tokens.get(self.pos + 1).map(|t| &t.kind);
-        let t2 = self.tokens.get(self.pos + 2).map(|t| &t.kind);
-        let t3 = self.tokens.get(self.pos + 3).map(|t| &t.kind);
-        matches!(t1, Some(TokenKind::Ident(_)))
-            && matches!(t2, Some(TokenKind::Assign))
-            && matches!(t3, Some(TokenKind::LBrace))
     }
 
     // ---- source / join ----
@@ -225,7 +244,7 @@ impl Parser {
         Ok(SourceClause { path, alias })
     }
 
-    fn parse_join_clause(&mut self) -> Result<JoinClause, QueryError> {
+    fn parse_join_clause(&mut self, kind: JoinKind) -> Result<JoinClause, QueryError> {
         let path = self.parse_path(/* allow_field_set */ false)?;
         if !self.consume_keyword(kw::AS) {
             return Err(QueryError::new(
@@ -241,7 +260,19 @@ impl Parser {
             ));
         }
         let on = self.parse_or()?;
-        Ok(JoinClause { path, alias, on })
+        Ok(JoinClause { path, alias, on, kind })
+    }
+
+    fn parse_unnest_clause(&mut self) -> Result<UnnestClause, QueryError> {
+        let expr = self.parse_or()?;
+        if !self.consume_keyword(kw::AS) {
+            return Err(QueryError::new(
+                self.peek().position,
+                "expected `as ALIAS` after `unnest EXPR`".into(),
+            ));
+        }
+        let alias = self.parse_alias_ident()?;
+        Ok(UnnestClause { expr, alias })
     }
 
     fn parse_alias_ident(&mut self) -> Result<String, QueryError> {
@@ -284,57 +315,6 @@ impl Parser {
         self.expect(&TokenKind::Assign, "expected `=` after `let NAME`")?;
         let expr = self.parse_or()?;
         Ok(AliasLet { name, expr })
-    }
-
-    fn parse_partition_block(&mut self) -> Result<Vec<PartitionDef>, QueryError> {
-        self.expect(&TokenKind::LBrace, "expected `{` after `partition`")?;
-        let mut partitions: Vec<PartitionDef> = Vec::new();
-        loop {
-            if matches!(self.peek().kind, TokenKind::RBrace) {
-                break;
-            }
-            let name_pos = self.peek().position;
-            let name = match &self.peek().kind {
-                TokenKind::Ident(s) => s.clone(),
-                TokenKind::Str(s) => s.clone(),
-                _ => {
-                    return Err(QueryError::new(
-                        name_pos,
-                        "expected partition name in `partition { ... }`".into(),
-                    ));
-                }
-            };
-            self.advance();
-            self.expect(
-                &TokenKind::Colon,
-                "expected `:` between partition name and predicate",
-            )?;
-            let pred = self.parse_or()?;
-            partitions.push(PartitionDef { name, pred });
-            if matches!(self.peek().kind, TokenKind::Comma) {
-                self.advance();
-                continue;
-            }
-            break;
-        }
-        self.expect(&TokenKind::RBrace, "expected `}` to close partition block")?;
-        if partitions.is_empty() {
-            return Err(QueryError::new(
-                self.peek().position,
-                "`partition { ... }` must declare at least one bucket".into(),
-            ));
-        }
-        for i in 0..partitions.len() {
-            for j in (i + 1)..partitions.len() {
-                if partitions[i].name == partitions[j].name {
-                    return Err(QueryError::new(
-                        0,
-                        format!("duplicate partition name `{}`", partitions[i].name),
-                    ));
-                }
-            }
-        }
-        Ok(partitions)
     }
 
     // ---- order by / limit ----
@@ -419,21 +399,21 @@ impl Parser {
         Ok(fields)
     }
 
-    // ---- let bindings (top-of-query field-set form) ----
+    // ---- field-set macros (top-of-query `fields NAME = { ... }`) ----
 
-    fn parse_let_binding(&mut self) -> Result<LetBinding, QueryError> {
+    fn parse_field_set_def(&mut self) -> Result<FieldSetDef, QueryError> {
         let pos = self.peek().position;
         let name = match &self.peek().kind {
             TokenKind::Ident(s) => s.clone(),
             _ => {
                 return Err(QueryError::new(
                     pos,
-                    "expected identifier after `let`".into(),
+                    "expected identifier after `fields`".into(),
                 ));
             }
         };
         self.advance();
-        self.expect(&TokenKind::Assign, "expected `=` after `let NAME`")?;
+        self.expect(&TokenKind::Assign, "expected `=` after `fields NAME`")?;
         self.expect(&TokenKind::LBrace, "expected `{` to start a field set")?;
         let mut fields = Vec::new();
         loop {
@@ -453,7 +433,7 @@ impl Parser {
                 _ => {
                     return Err(QueryError::new(
                         pos,
-                        "expected field name in `let` field set".into(),
+                        "expected field name in `fields` set".into(),
                     ));
                 }
             }
@@ -463,14 +443,14 @@ impl Parser {
             }
             break;
         }
-        self.expect(&TokenKind::RBrace, "expected `}` to end `let` field set")?;
+        self.expect(&TokenKind::RBrace, "expected `}` to end `fields` set")?;
         if fields.is_empty() {
             return Err(QueryError::new(
                 self.peek().position,
-                "`let` field set must contain at least one field".into(),
+                "`fields NAME = { ... }` must contain at least one field".into(),
             ));
         }
-        Ok(LetBinding { name, fields })
+        Ok(FieldSetDef { name, fields })
     }
 
     // ---- aggregate ----
@@ -478,166 +458,41 @@ impl Parser {
     fn parse_aggregate_clause_opt(&mut self) -> Result<Option<AggregateClause>, QueryError> {
         if self.peek_keyword(kw::AGGREGATE) {
             self.advance();
-            // Look ahead for `each`: distinguishes the partition-iteration
-            // form from the named-reduction block form.
-            if self.consume_keyword(kw::EACH) {
-                return Ok(Some(AggregateClause::EachPartition(
-                    self.parse_each_partition_body()?,
-                )));
-            }
             return Ok(Some(AggregateClause::Block(self.parse_aggregate_block()?)));
         }
-        if self.peek_keyword(kw::GROUP) {
+        if self.peek_keyword(kw::COLLECT) {
             self.advance();
             if !self.consume_keyword(kw::BY) {
                 return Err(QueryError::new(
                     self.peek().position,
-                    "expected `by` after `group`".into(),
+                    "expected `by` after `collect`".into(),
                 ));
             }
             let key = self.parse_or()?;
             return Ok(Some(AggregateClause::Group(GroupClause { key })));
         }
-        if let Some(short) = self.parse_aggregate_shorthand_opt()? {
-            return Ok(Some(AggregateClause::Shorthand(short)));
+        // A bare reducer keyword at clause position is not a valid clause —
+        // reducer calls only exist inside an `aggregate { ... }` block.
+        if self.peek_keyword(kw::SUM)
+            || self.peek_keyword(kw::COUNT)
+            || self.peek_keyword(kw::AVG)
+            || self.peek_keyword(kw::MIN)
+            || self.peek_keyword(kw::MAX)
+        {
+            let op_name = match &self.peek().kind {
+                TokenKind::Ident(s) => s.clone(),
+                _ => unreachable!(),
+            };
+            return Err(QueryError::new(
+                self.peek().position,
+                format!(
+                    "reducer `{}` is only valid inside `aggregate {{ ... }}` — write \
+                     `aggregate {{ <name>: {}(<expr>) }} [by KEY]` instead",
+                    op_name, op_name
+                ),
+            ));
         }
         Ok(None)
-    }
-
-    /// `aggregate each partition as IDENT => IDENT.name: { OBJECT }`.
-    /// The `aggregate each` prefix is already consumed.
-    fn parse_each_partition_body(&mut self) -> Result<EachPartitionClause, QueryError> {
-        if !self.consume_keyword(kw::PARTITION) {
-            return Err(QueryError::new(
-                self.peek().position,
-                "expected `partition` after `aggregate each`".into(),
-            ));
-        }
-        if !self.consume_keyword(kw::AS) {
-            return Err(QueryError::new(
-                self.peek().position,
-                "expected `as ALIAS` after `aggregate each partition`".into(),
-            ));
-        }
-        let alias = self.parse_alias_ident()?;
-        if !matches!(self.peek().kind, TokenKind::FatArrow) {
-            return Err(QueryError::new(
-                self.peek().position,
-                "expected `=>` after `aggregate each partition as ALIAS`".into(),
-            ));
-        }
-        self.advance();
-
-        // Body must start with `ALIAS.name: { ... }`. We validate it
-        // structurally so error messages stay specific.
-        let header_pos = self.peek().position;
-        let header_ident = match &self.peek().kind {
-            TokenKind::Ident(s) => s.clone(),
-            _ => {
-                return Err(QueryError::new(
-                    header_pos,
-                    format!("expected `{}.name` after `=>`", alias),
-                ));
-            }
-        };
-        if header_ident != alias {
-            return Err(QueryError::new(
-                header_pos,
-                format!(
-                    "expected `{}.name` after `=>` (got `{}`)",
-                    alias, header_ident
-                ),
-            ));
-        }
-        self.advance();
-        if !matches!(self.peek().kind, TokenKind::Dot) {
-            return Err(QueryError::new(
-                self.peek().position,
-                format!("expected `.name` after `{}`", alias),
-            ));
-        }
-        self.advance();
-        let name_pos = self.peek().position;
-        let name_ident = match &self.peek().kind {
-            TokenKind::Ident(s) => s.clone(),
-            _ => {
-                return Err(QueryError::new(
-                    name_pos,
-                    format!("expected `name` after `{}.`", alias),
-                ));
-            }
-        };
-        if name_ident != "name" {
-            return Err(QueryError::new(
-                name_pos,
-                format!(
-                    "only `{}.name` is accessible inside `aggregate each partition` \
-                     (got `{}.{}`)",
-                    alias, alias, name_ident
-                ),
-            ));
-        }
-        self.advance();
-        self.expect(
-            &TokenKind::Colon,
-            "expected `:` between partition-name accessor and body",
-        )?;
-        // Body must be an object literal; the per-partition output shape.
-        if !matches!(self.peek().kind, TokenKind::LBrace) {
-            return Err(QueryError::new(
-                self.peek().position,
-                "expected `{ ... }` body after `=> p.name:`".into(),
-            ));
-        }
-        let body = self.parse_primary()?;
-        Ok(EachPartitionClause {
-            partition_alias: alias,
-            body,
-        })
-    }
-
-    fn parse_aggregate_shorthand_opt(
-        &mut self,
-    ) -> Result<Option<AggregateShorthand>, QueryError> {
-        let op = if self.peek_keyword(kw::SUM) {
-            AggOp::Sum
-        } else if self.peek_keyword(kw::COUNT) {
-            AggOp::Count
-        } else if self.peek_keyword(kw::AVG) {
-            AggOp::Avg
-        } else if self.peek_keyword(kw::MIN) {
-            AggOp::Min
-        } else if self.peek_keyword(kw::MAX) {
-            AggOp::Max
-        } else {
-            return Ok(None);
-        };
-        self.advance();
-
-        let arg = if matches!(op, AggOp::Count)
-            && (self.peek_keyword(kw::BY) || self.is_at_end_of_clause())
-        {
-            None
-        } else {
-            Some(self.parse_or()?)
-        };
-
-        let group_by = if self.consume_keyword(kw::BY) {
-            self.parse_group_keys()?
-        } else {
-            Vec::new()
-        };
-
-        Ok(Some(AggregateShorthand { op, arg, group_by }))
-    }
-
-    fn is_at_end_of_clause(&self) -> bool {
-        matches!(self.peek().kind, TokenKind::Eof)
-            || self.peek_keyword(kw::SELECT)
-            || self.peek_keyword(kw::ORDER)
-            || self.peek_keyword(kw::LIMIT)
-            || self.peek_keyword(kw::AGGREGATE)
-            || self.peek_keyword(kw::DISTINCT)
     }
 
     fn parse_aggregate_block(&mut self) -> Result<AggregateBlock, QueryError> {
@@ -661,19 +516,26 @@ impl Parser {
                 "aggregate block must contain at least one reduction".into(),
             ));
         }
-        let group_by = if self.consume_keyword(kw::BY) {
-            let group_keys = self.parse_group_keys()?;
-            if group_keys.len() != 1 {
-                return Err(QueryError::new(
-                    self.peek().position,
-                    "aggregate block currently supports a single group key only".into(),
-                ));
+        let (group_by, rollup) = if self.consume_keyword(kw::BY) {
+            if self.consume_keyword(kw::ROLLUP) {
+                self.expect(&TokenKind::LParen, "expected `(` after `rollup`")?;
+                let keys = self.parse_group_keys()?;
+                self.expect(
+                    &TokenKind::RParen,
+                    "expected `)` to close `rollup(...)`",
+                )?;
+                (keys, true)
+            } else {
+                (self.parse_group_keys()?, false)
             }
-            Some(group_keys.into_iter().next().unwrap())
         } else {
-            None
+            (Vec::new(), false)
         };
-        Ok(AggregateBlock { reductions, group_by })
+        Ok(AggregateBlock {
+            reductions,
+            group_by,
+            rollup,
+        })
     }
 
     fn parse_agg_block_item(&mut self) -> Result<AggBlockItem, QueryError> {
@@ -918,9 +780,18 @@ impl Parser {
         match token.kind {
             TokenKind::LParen => {
                 self.advance();
-                let inner = self.parse_or()?;
-                self.expect(&TokenKind::RParen, "expected `)`")?;
-                Ok(inner)
+                // A parenthesised group that opens with `from` (or a
+                // leading `fields` macro) is a subquery, not a grouped
+                // expression — parse a full nested query.
+                if self.peek_keyword(kw::FROM) || self.peek_keyword(kw::FIELDS) {
+                    let q = self.parse_query()?;
+                    self.expect(&TokenKind::RParen, "expected `)` to close subquery")?;
+                    Ok(Expr::Subquery(Box::new(q)))
+                } else {
+                    let inner = self.parse_or()?;
+                    self.expect(&TokenKind::RParen, "expected `)`")?;
+                    Ok(inner)
+                }
             }
             TokenKind::LBrace => {
                 self.advance();
@@ -962,6 +833,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Lit(Lit::Str(s)))
             }
+            TokenKind::Param(name) => {
+                self.advance();
+                Ok(Expr::Param(name))
+            }
             TokenKind::Dot => {
                 let path = self.parse_path(/* allow_field_set */ true)?;
                 Ok(Expr::Path(path))
@@ -979,8 +854,17 @@ impl Parser {
                     self.advance();
                     Ok(Expr::Lit(Lit::Null))
                 }
-                kw::ROUND => self.parse_round(),
+                kw::IF => self.parse_if(),
                 kw::SUM | kw::COUNT | kw::AVG | kw::MIN | kw::MAX => self.parse_reducer_call(),
+                // Strict scalar functions (`round`, `length`, `lower`, …)
+                // when immediately applied. A bare function name not
+                // followed by `(` falls through to the path parser so it
+                // can still name a field.
+                _ if super::super::grammar::function(name.as_str()).is_some()
+                    && matches!(self.peek_at(1).kind, TokenKind::LParen) =>
+                {
+                    self.parse_call()
+                }
                 _ => {
                     // Bare-name path: `s`, `s.warehouse_id`, etc.
                     let path = self.parse_path(/* allow_field_set */ true)?;
@@ -1027,20 +911,86 @@ impl Parser {
         Ok(Expr::Reducer { op, arg })
     }
 
-    fn parse_round(&mut self) -> Result<Expr, QueryError> {
-        self.advance();
-        self.expect(&TokenKind::LParen, "expected `(` after `round`")?;
-        let value = self.parse_or()?;
-        let precision = if matches!(self.peek().kind, TokenKind::Comma) {
-            self.advance();
-            Some(Box::new(self.parse_or()?))
-        } else {
-            None
+    /// Generic strict-function call `name(arg, ...)`. The leading ident is
+    /// a known `grammar::FUNCTIONS` entry (the caller already checked) and
+    /// is followed by `(`. Validates argument count against the spec.
+    fn parse_call(&mut self) -> Result<Expr, QueryError> {
+        let name_pos = self.peek().position;
+        let name = match &self.peek().kind {
+            TokenKind::Ident(s) => s.clone(),
+            _ => unreachable!("parse_call invoked on non-ident"),
         };
-        self.expect(&TokenKind::RParen, "expected `)` to close `round(...)`")?;
-        Ok(Expr::Round {
-            value: Box::new(value),
-            precision,
+        self.advance();
+        self.expect(&TokenKind::LParen, "expected `(` after function name")?;
+        let mut args = Vec::new();
+        if !matches!(self.peek().kind, TokenKind::RParen) {
+            args.push(self.parse_or()?);
+            while matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+                args.push(self.parse_or()?);
+            }
+        }
+        self.expect(&TokenKind::RParen, "expected `)` to close function call")?;
+        let spec = super::super::grammar::function(&name)
+            .expect("parse_call invoked on unknown function");
+        if args.len() < spec.min_args || args.len() > spec.max_args {
+            let arity = if spec.min_args == spec.max_args {
+                format!("{}", spec.min_args)
+            } else {
+                format!("{} to {}", spec.min_args, spec.max_args)
+            };
+            return Err(QueryError::new(
+                name_pos,
+                format!(
+                    "`{}` takes {} argument(s), got {}",
+                    name,
+                    arity,
+                    args.len()
+                ),
+            ));
+        }
+        Ok(Expr::Call(name, args))
+    }
+
+    /// `if(COND, THEN, ELSE)`. Exactly three comma-separated arguments;
+    /// no two-arg form (use `?? null` explicitly if you want a missing
+    /// `else`).
+    fn parse_if(&mut self) -> Result<Expr, QueryError> {
+        let kw_pos = self.peek().position;
+        self.advance();
+        self.expect(&TokenKind::LParen, "expected `(` after `if`")?;
+        let cond = self.parse_or()?;
+        if !matches!(self.peek().kind, TokenKind::Comma) {
+            return Err(QueryError::new(
+                self.peek().position,
+                "expected `,` after `if` condition — `if` requires three arguments \
+                 `if(COND, THEN, ELSE)`"
+                    .into(),
+            ));
+        }
+        self.advance();
+        let then_branch = self.parse_or()?;
+        if !matches!(self.peek().kind, TokenKind::Comma) {
+            return Err(QueryError::new(
+                self.peek().position,
+                "expected `,` after `if` then-branch — `if` requires three arguments \
+                 `if(COND, THEN, ELSE)`"
+                    .into(),
+            ));
+        }
+        self.advance();
+        let else_branch = self.parse_or()?;
+        if matches!(self.peek().kind, TokenKind::Comma) {
+            return Err(QueryError::new(
+                kw_pos,
+                "`if` takes exactly three arguments `if(COND, THEN, ELSE)`".into(),
+            ));
+        }
+        self.expect(&TokenKind::RParen, "expected `)` to close `if(...)`")?;
+        Ok(Expr::If {
+            cond: Box::new(cond),
+            then_branch: Box::new(then_branch),
+            else_branch: Box::new(else_branch),
         })
     }
 
@@ -1147,13 +1097,12 @@ impl Parser {
         }
     }
 
-    /// Brackets carry one of: `[*]` (iterate), `[N]` (numeric index),
+    /// Brackets carry one of: `[]` (iterate), `[N]` (numeric index),
     /// or `["field"]` (quoted field).
     fn parse_bracket_seg(&mut self) -> Result<PathSeg, QueryError> {
         match self.peek().kind.clone() {
-            TokenKind::Star => {
+            TokenKind::RBrack => {
                 self.advance();
-                self.expect(&TokenKind::RBrack, "expected `]` after `[*`")?;
                 Ok(PathSeg::Iterate)
             }
             TokenKind::Number(n) => {
@@ -1176,7 +1125,7 @@ impl Parser {
             other => Err(QueryError::new(
                 self.peek().position,
                 format!(
-                    "unexpected {} in brackets (expected `*`, an integer index, or a quoted field)",
+                    "unexpected {} in brackets (expected `]`, an integer index, or a quoted field)",
                     other.description()
                 ),
             )),

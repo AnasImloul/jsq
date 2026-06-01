@@ -18,11 +18,11 @@ const MAX_WIDTH: usize = 80;
 pub fn format_query(q: &Query) -> String {
     let mut out = String::new();
 
-    for lb in &q.lets {
-        format_let_binding(&mut out, lb);
+    for fs in &q.field_sets {
+        format_field_set_def(&mut out, fs);
         out.push('\n');
     }
-    if !q.lets.is_empty() {
+    if !q.field_sets.is_empty() {
         out.push('\n');
     }
 
@@ -39,6 +39,10 @@ pub fn format_query(q: &Query) -> String {
     // `join PATH as ALIAS on EXPR` — each on its own line, with the
     // `on …` aligned under the join keyword for scannable predicates.
     for j in &q.joins {
+        if matches!(j.kind, JoinKind::Left) {
+            out.push_str(kw::LEFT);
+            out.push(' ');
+        }
         out.push_str(kw::JOIN);
         out.push(' ');
         format_path(&mut out, &j.path);
@@ -51,6 +55,18 @@ pub fn format_query(q: &Query) -> String {
         out.push_str(kw::ON);
         out.push(' ');
         format_expr(&mut out, &j.on);
+        out.push('\n');
+    }
+
+    // `unnest EXPR as ALIAS` — one per line, between the joins and where.
+    for u in &q.unnests {
+        out.push_str(kw::UNNEST);
+        out.push(' ');
+        format_expr(&mut out, &u.expr);
+        out.push(' ');
+        out.push_str(kw::AS);
+        out.push(' ');
+        out.push_str(&u.alias);
         out.push('\n');
     }
 
@@ -81,17 +97,18 @@ pub fn format_query(q: &Query) -> String {
         out.push('\n');
     }
 
-    if !q.partitions.is_empty() {
-        format_partition_block(&mut out, &q.partitions);
-    }
-
     if let Some(agg) = &q.aggregate {
         match agg {
-            AggregateClause::Shorthand(s) => format_shorthand(&mut out, s),
             AggregateClause::Block(b) => format_aggregate_block(&mut out, b),
             AggregateClause::Group(g) => format_group(&mut out, g),
-            AggregateClause::EachPartition(ep) => format_each_partition(&mut out, ep),
         }
+    }
+
+    if let Some(pred) = &q.having {
+        out.push_str(kw::HAVING);
+        out.push(' ');
+        format_expr(&mut out, pred);
+        out.push('\n');
     }
 
     if let Some(fields) = &q.project {
@@ -114,15 +131,15 @@ pub fn format_query(q: &Query) -> String {
 
 // ---- top-level clauses ----
 
-fn format_let_binding(out: &mut String, lb: &LetBinding) {
-    out.push_str(kw::LET);
+fn format_field_set_def(out: &mut String, fs: &FieldSetDef) {
+    out.push_str(kw::FIELDS);
     out.push(' ');
-    out.push_str(&lb.name);
+    out.push_str(&fs.name);
     out.push_str(" = {\n");
-    for (i, f) in lb.fields.iter().enumerate() {
+    for (i, f) in fs.fields.iter().enumerate() {
         out.push_str(INDENT);
         out.push_str(f);
-        if i + 1 < lb.fields.len() {
+        if i + 1 < fs.fields.len() {
             out.push(',');
         }
         out.push('\n');
@@ -243,49 +260,13 @@ fn format_agg_op(op: AggOp) -> &'static str {
     }
 }
 
-fn format_shorthand(out: &mut String, s: &AggregateShorthand) {
-    out.push_str(format_agg_op(s.op));
-    if let Some(arg) = &s.arg {
-        out.push(' ');
-        format_expr(out, arg);
-    }
-    if !s.group_by.is_empty() {
-        out.push(' ');
-        out.push_str(kw::BY);
-        out.push(' ');
-        for (i, k) in s.group_by.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            format_expr(out, k);
-        }
-    }
-    out.push('\n');
-}
-
 fn format_group(out: &mut String, g: &GroupClause) {
-    out.push_str(kw::GROUP);
+    out.push_str(kw::COLLECT);
     out.push(' ');
     out.push_str(kw::BY);
     out.push(' ');
     format_expr(out, &g.key);
     out.push('\n');
-}
-
-fn format_partition_block(out: &mut String, partitions: &[PartitionDef]) {
-    out.push_str(kw::PARTITION);
-    out.push_str(" {\n");
-    for (i, p) in partitions.iter().enumerate() {
-        out.push_str(INDENT);
-        out.push_str(&p.name);
-        out.push_str(": ");
-        format_expr(out, &p.pred);
-        if i + 1 < partitions.len() {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    out.push_str("}\n");
 }
 
 fn format_aggregate_block(out: &mut String, b: &AggregateBlock) {
@@ -315,31 +296,23 @@ fn format_aggregate_block(out: &mut String, b: &AggregateBlock) {
         out.push('\n');
     }
     out.push('}');
-    if let Some(group) = &b.group_by {
+    if !b.group_by.is_empty() {
         out.push(' ');
         out.push_str(kw::BY);
         out.push(' ');
-        format_expr(out, group);
-    }
-    out.push('\n');
-}
-
-fn format_each_partition(out: &mut String, ep: &EachPartitionClause) {
-    out.push_str(kw::AGGREGATE);
-    out.push(' ');
-    out.push_str(kw::EACH);
-    out.push(' ');
-    out.push_str(kw::PARTITION);
-    out.push(' ');
-    out.push_str(kw::AS);
-    out.push(' ');
-    out.push_str(&ep.partition_alias);
-    out.push_str(" => ");
-    out.push_str(&ep.partition_alias);
-    out.push_str(".name: ");
-    match &ep.body {
-        Expr::Object(fields) => format_object_multiline(out, fields, /* depth */ 0),
-        other => format_expr(out, other),
+        if b.rollup {
+            out.push_str(kw::ROLLUP);
+            out.push('(');
+        }
+        for (i, k) in b.group_by.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            format_expr(out, k);
+        }
+        if b.rollup {
+            out.push(')');
+        }
     }
     out.push('\n');
 }
@@ -409,6 +382,10 @@ fn format_expr(out: &mut String, e: &Expr) {
     match e {
         Expr::Path(p) => format_path(out, p),
         Expr::Lit(l) => format_lit(out, l),
+        Expr::Param(name) => {
+            out.push('$');
+            out.push_str(name);
+        }
         Expr::Array(items) => {
             out.push('[');
             for (i, it) in items.iter().enumerate() {
@@ -534,13 +511,43 @@ fn format_expr(out: &mut String, e: &Expr) {
             out.push(' ');
             out.push_str(kind.keyword());
         }
-        Expr::Round { value, precision } => {
-            out.push_str(kw::ROUND);
+        Expr::Call(name, args) => {
+            out.push_str(name);
             out.push('(');
-            format_expr(out, value);
-            if let Some(p) = precision {
-                out.push_str(", ");
-                format_expr(out, p);
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                format_expr(out, a);
+            }
+            out.push(')');
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            out.push_str(kw::IF);
+            out.push('(');
+            format_expr(out, cond);
+            out.push_str(", ");
+            format_expr(out, then_branch);
+            out.push_str(", ");
+            format_expr(out, else_branch);
+            out.push(')');
+        }
+        Expr::Subquery(q) => {
+            // The block formatter lays a query out one clause per line;
+            // inline that into a single parenthesised line so the
+            // subquery reads as one expression and re-formats idempotently.
+            out.push('(');
+            let mut first = true;
+            for line in format_query(q).lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !first {
+                    out.push(' ');
+                }
+                out.push_str(trimmed);
+                first = false;
             }
             out.push(')');
         }
@@ -578,7 +585,7 @@ fn format_binary_operand(out: &mut String, parent: BinaryOp, e: &Expr, is_left: 
 
 fn format_atom(out: &mut String, e: &Expr) {
     match e {
-        Expr::Lit(_) | Expr::Path(_) | Expr::Reducer { .. } => format_expr(out, e),
+        Expr::Lit(_) | Expr::Param(_) | Expr::Path(_) | Expr::Reducer { .. } => format_expr(out, e),
         _ => {
             out.push('(');
             format_expr(out, e);
@@ -670,7 +677,7 @@ fn format_path(out: &mut String, p: &PathExpr) {
             }
             PathSeg::Iterate => {
                 first = false;
-                out.push_str("[*]");
+                out.push_str("[]");
             }
             PathSeg::StarStar => {
                 out.push_str(if first && matches!(p.root, PathRoot::Identity) {

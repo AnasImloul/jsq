@@ -126,8 +126,7 @@ fn is_value_intro_keyword(s: &str) -> bool {
             | "where"
             | "select"
             | "aggregate"
-            | "each"
-            | "group"
+            | "collect"
             | "order"
             | "limit"
             | "from"
@@ -135,7 +134,7 @@ fn is_value_intro_keyword(s: &str) -> bool {
             | "on"
             | "as"
             | "let"
-            | "partition"
+            | "fields"
             | "in"
             | "matches"
             | "starts_with"
@@ -158,9 +157,8 @@ fn is_clause_with_body(s: &str) -> bool {
             | "from"
             | "join"
             | "on"
-            | "group"
+            | "collect"
             | "order"
-            | "partition"
     )
 }
 
@@ -261,7 +259,7 @@ fn compute_context_query(tokens: &[Token], pre_partial: &str) -> String {
                     end = strip_trailing_operand(tokens, end - 1);
                     if end > 0 {
                         if let TokenKind::Ident(k) = &tokens[end - 1].kind {
-                            if k == kw::GROUP || k == kw::ORDER {
+                            if k == kw::COLLECT || k == kw::ORDER {
                                 end -= 1;
                             }
                         }
@@ -328,14 +326,14 @@ fn strip_trailing_operand(tokens: &[Token], end: usize) -> usize {
 fn is_operand_boundary(t: &TokenKind) -> bool {
     use TokenKind::*;
     match t {
-        Pipe | Comma | Semi | Eq | Ne | Lt | Le | Gt | Ge | Assign | FatArrow => true,
+        Pipe | Comma | Semi | Eq | Ne | Lt | Le | Gt | Ge | Assign => true,
         Ident(s) => matches!(
             s.as_str(),
             "and" | "or" | "not"
-                | "where" | "select" | "aggregate" | "each" | "group" | "order"
+                | "where" | "select" | "aggregate" | "collect" | "order"
                 | "limit" | "by"
                 | "from" | "join" | "on" | "as"
-                | "let" | "distinct" | "partition" | "in"
+                | "let" | "distinct" | "fields" | "in"
                 | "matches" | "starts_with" | "ends_with" | "contains"
         ),
         _ => false,
@@ -480,9 +478,9 @@ mod tests {
 
     #[test]
     fn dot_after_path_resolves_against_path() {
-        let c = classify_at_end(".users[*].").unwrap();
+        let c = classify_at_end(".users[].").unwrap();
         assert_eq!(c.mode, CompletionMode::FieldAccess);
-        assert_eq!(c.context_query.as_deref(), Some(".users[*]"));
+        assert_eq!(c.context_query.as_deref(), Some(".users[]"));
     }
 
     #[test]
@@ -538,8 +536,8 @@ mod tests {
     }
 
     #[test]
-    fn group_by_then_dot() {
-        let c = classify_at_end("from .users as u group by .").unwrap();
+    fn collect_by_then_dot() {
+        let c = classify_at_end("from .users as u collect by .").unwrap();
         assert_eq!(c.mode, CompletionMode::FieldAccess);
     }
 
@@ -550,8 +548,8 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_count_by_dot() {
-        let c = classify_at_end("from .x as x aggregate count by .").unwrap();
+    fn aggregate_block_by_dot() {
+        let c = classify_at_end("from .x as x aggregate { n: count() } by .").unwrap();
         assert_eq!(c.mode, CompletionMode::FieldAccess);
     }
 }

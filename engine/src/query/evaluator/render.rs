@@ -1,220 +1,202 @@
-//! Result-row rendering. Translates a `Value` (engine node, synthetic
-//! literal, group bucket, projection object, …) into the
-//! path/preview/full_text triple that crosses the FFI boundary.
+//! Result-row construction and on-demand presentation helpers.
+//!
+//! `make_result` packages a `Value` into a `QueryResult` with its
+//! cached `kind` and `path`; the JSON / preview strings are derived on
+//! demand by `write_value_json` and `value_preview`. Keeping the row
+//! to a single value representation means every consumer (NDJSON,
+//! JSON-array, CSV preview column, FFI marshalling) shares the same
+//! serializer — no real-vs-synthetic split that could drift.
 //!
 //! Number / string formatting helpers (`format_number`, `json_escape`)
 //! also live here since they're reused by the evaluator's group-key
 //! and fingerprint paths.
 
-use crate::document::{Document, NodeKind, NULL_NODE};
+use crate::document::{Document, NodeKind};
 use crate::path::compute_path;
 
 use super::super::value::Value;
 use super::QueryResult;
 
 pub(super) fn make_result(doc: &Document, v: &Value) -> QueryResult {
+    QueryResult {
+        kind: kind_to_u8(value_kind(doc, v)),
+        path: value_path(doc, v),
+        value: v.clone(),
+    }
+}
+
+/// Best-effort `NodeKind` for any `Value`. Real nodes consult the
+/// document; synthetic variants map to the conceptually-closest kind
+/// so the FFI's `kind` byte / CSV type column stay meaningful.
+pub(crate) fn value_kind(doc: &Document, v: &Value) -> NodeKind {
     match v {
-        Value::Node(id) => {
-            let kind = doc.node_kind(*id);
-            let path = String::from_utf8_lossy(&compute_path(doc, *id)).into_owned();
-            match kind {
-                NodeKind::Array | NodeKind::Object => {
-                    let count = doc.records()[*id as usize].child_count;
-                    let preview = container_preview(kind, count);
-                    QueryResult {
-                        node_id: *id,
-                        kind: kind_to_u8(kind),
-                        path,
-                        preview,
-                        full_text: String::new(),
-                    }
-                }
-                _ => {
-                    let raw_bytes = doc.value_bytes(*id).unwrap_or(&[]);
-                    let raw = String::from_utf8_lossy(raw_bytes).into_owned();
-                    let preview = truncate(&raw, 80);
-                    QueryResult {
-                        node_id: *id,
-                        kind: kind_to_u8(kind),
-                        path,
-                        preview,
-                        full_text: raw,
-                    }
-                }
-            }
-        }
-        Value::Null => synthetic_result("null", NodeKind::Null),
-        Value::Bool(b) => {
-            let s = if *b { "true" } else { "false" };
-            synthetic_result(s, NodeKind::Bool)
-        }
-        Value::Number(n) => synthetic_result(&format_number(*n), NodeKind::Number),
-        Value::Str(s) => {
-            let q = format!("\"{}\"", json_escape(s));
-            synthetic_result(&q, NodeKind::String)
-        }
-        Value::Group { key, n } => {
-            let (formatted, kind) = match n {
-                Some(v) => (format_number(*v), NodeKind::Number),
-                None => ("null".to_string(), NodeKind::Null),
-            };
-            QueryResult {
-                node_id: NULL_NODE,
-                kind: kind_to_u8(kind),
-                path: key.clone(),
-                preview: truncate(&formatted, 80),
-                full_text: formatted,
-            }
-        }
-        Value::GroupList { key, members } => {
-            let count = members.len();
-            let label = if count == 1 { "item" } else { "items" };
-            let preview = format!("[{} {}]", count, label);
-            // Click-through: select the first member so the inspector
-            // jumps into the group; the result row's path advertises
-            // the group key.
-            QueryResult {
-                node_id: members.first().copied().unwrap_or(NULL_NODE),
-                kind: kind_to_u8(NodeKind::Array),
-                path: key.clone(),
-                preview,
-                full_text: format!("{}: {} {}", key, count, label),
-            }
-        }
-        Value::Object(fields) => {
-            let json = render_synthetic_object(doc, fields);
-            QueryResult {
-                node_id: NULL_NODE,
-                kind: kind_to_u8(NodeKind::Object),
-                path: format!("(synthetic) {{ {} keys }}", fields.len()),
-                preview: truncate(&json, 80),
-                full_text: json,
-            }
-        }
-        Value::NamedValue { name, value } => {
-            // Output of an aggregate-no-by item whose value isn't a
-            // scalar (object-valued aggregates, group lists). The
-            // `name` is the user-written item name; surfacing it as
-            // the row's path and the inner value's JSON in `full_text`
-            // lets the UI render the row as a labeled top-level entry
-            // instead of an opaque synthetic wrapper.
-            let json = render_value_inline(doc, value);
-            QueryResult {
-                node_id: NULL_NODE,
-                kind: kind_to_u8(inner_kind(value)),
-                path: name.clone(),
-                preview: truncate(&json, 80),
-                full_text: json,
-            }
-        }
-        // Aggregate-by row. First field is the group key — surface
-        // its rendered value as the row's path. The remaining fields
-        // are the reductions, rendered as a JSON object in the value
-        // column. Empty bucket rows (shouldn't happen — the
-        // aggregate emits at least the key) fall back to the
-        // generic Object preview.
+        Value::Null => NodeKind::Null,
+        Value::Bool(_) => NodeKind::Bool,
+        Value::Number(_) => NodeKind::Number,
+        Value::Str(_) => NodeKind::String,
+        Value::Group { n: Some(_), .. } => NodeKind::Number,
+        Value::Group { n: None, .. } => NodeKind::Null,
+        Value::GroupList { .. } | Value::Array(_) => NodeKind::Array,
+        Value::Object(_) | Value::BucketRow(_) => NodeKind::Object,
+        Value::NamedValue { value, .. } => value_kind(doc, value),
+        Value::Node(id) => doc.node_kind(*id),
+    }
+}
+
+/// Per-variant row path. For real nodes the literal JSON pointer; for
+/// synthetic rows a label derived from the variant (group key, named
+/// item, or a `(synthetic) …` marker that the UI uses to suppress
+/// path-based navigation).
+fn value_path(doc: &Document, v: &Value) -> String {
+    match v {
+        Value::Node(id) => String::from_utf8_lossy(&compute_path(doc, *id)).into_owned(),
+        Value::Null => "(synthetic) null".into(),
+        Value::Bool(b) => format!("(synthetic) {}", if *b { "true" } else { "false" }),
+        Value::Number(n) => format!("(synthetic) {}", truncate(&format_number(*n), 64)),
+        Value::Str(s) => format!("(synthetic) \"{}\"", truncate(&json_escape(s), 60)),
+        Value::Group { key, .. } => key.clone(),
+        Value::GroupList { key, .. } => key.clone(),
+        Value::Object(fields) => format!("(synthetic) {{ {} keys }}", fields.len()),
+        Value::Array(items) => format!("(synthetic) [ {} items ]", items.len()),
+        Value::NamedValue { name, .. } => name.clone(),
         Value::BucketRow(fields) => {
             if fields.is_empty() {
-                return QueryResult {
-                    node_id: NULL_NODE,
-                    kind: kind_to_u8(NodeKind::Object),
-                    path: "(synthetic) { }".into(),
-                    preview: "{}".into(),
-                    full_text: "{}".into(),
-                };
+                return "(synthetic) { }".into();
             }
             let (_key_name, key_value) = &fields[0];
-            let path = render_value_inline(doc, key_value);
-            // Strip wrapping quotes on string keys for a cleaner
-            // path label — the row is "day", not `"day"`.
-            let path = path.trim_matches('"').to_string();
-            let json = render_synthetic_object(doc, &fields[1..]);
-            QueryResult {
-                node_id: NULL_NODE,
-                kind: kind_to_u8(NodeKind::Object),
-                path,
-                preview: truncate(&json, 80),
-                full_text: json,
-            }
+            let mut buf = String::new();
+            write_value_json(&mut buf, doc, key_value);
+            // String keys come back quoted; the UI wants the bare label.
+            buf.trim_matches('"').to_string()
         }
     }
 }
 
-/// Renders a synthetic object as a single-line JSON string. Used for
-/// preview/full_text on result rows produced by surface `select { ... }`
-/// projections. Field order is preserved from the AST.
-fn render_synthetic_object(doc: &Document, fields: &[(String, Value)]) -> String {
-    let mut out = String::with_capacity(2 + fields.len() * 16);
-    out.push('{');
-    for (i, (k, v)) in fields.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        out.push('"');
-        out.push_str(&json_escape(k));
-        out.push_str("\": ");
-        out.push_str(&render_value_inline(doc, v));
-    }
-    out.push('}');
-    out
-}
-
-fn render_value_inline(doc: &Document, v: &Value) -> String {
+/// Write the JSON encoding of `v` into `out`. Real-node values copy
+/// their source bytes verbatim from the mmap (zero-copy for nested
+/// containers — this is the property that makes NDJSON output safe
+/// to pipe into `jq`). Synthetic values recurse.
+pub fn write_value_json(out: &mut String, doc: &Document, v: &Value) {
     match v {
-        Value::Null => "null".into(),
-        Value::Bool(b) => if *b { "true".into() } else { "false".into() },
-        Value::Number(n) => format_number(*n),
-        Value::Str(s) => format!("\"{}\"", json_escape(s)),
-        Value::Group { n: Some(v), .. } => format_number(*v),
-        Value::Group { n: None, .. } => "null".into(),
-        Value::GroupList { members, .. } => format!("[{} items]", members.len()),
-        Value::Object(fs) | Value::BucketRow(fs) => render_synthetic_object(doc, fs),
-        Value::NamedValue { value, .. } => render_value_inline(doc, value),
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => out.push_str(&format_number(*n)),
+        Value::Str(s) => {
+            out.push('"');
+            escape_into(out, s);
+            out.push('"');
+        }
+        Value::Group { n: Some(v), .. } => out.push_str(&format_number(*v)),
+        Value::Group { n: None, .. } => out.push_str("null"),
+        Value::GroupList { members, .. } => {
+            // Bucket of node ids — render as a real JSON array of each
+            // member's source JSON. Inlining the members keeps the
+            // NDJSON output composable with `jq` without an additional
+            // pass.
+            out.push('[');
+            for (i, id) in members.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_node_json(out, doc, *id);
+            }
+            out.push(']');
+        }
+        Value::Object(fields) | Value::BucketRow(fields) => {
+            out.push('{');
+            for (i, (k, val)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push('"');
+                escape_into(out, k);
+                out.push_str("\": ");
+                write_value_json(out, doc, val);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_value_json(out, doc, item);
+            }
+            out.push(']');
+        }
+        Value::NamedValue { value, .. } => write_value_json(out, doc, value),
+        Value::Node(id) => write_node_json(out, doc, *id),
+    }
+}
+
+fn write_node_json(out: &mut String, doc: &Document, id: u32) {
+    match doc.value_bytes(id) {
+        Some(bytes) => match std::str::from_utf8(bytes) {
+            Ok(s) => out.push_str(s),
+            Err(_) => out.push_str("null"),
+        },
+        None => out.push_str("null"),
+    }
+}
+
+/// Short, human-friendly value rendering used for the CSV/TSV preview
+/// column and the Swift table view. Containers collapse to a `[N items]`
+/// / `{N keys}` placeholder; everything else falls through to the JSON
+/// encoding, truncated to `cap` bytes.
+pub(crate) fn value_preview(doc: &Document, v: &Value, cap: usize) -> String {
+    match v {
+        Value::GroupList { members, .. } => {
+            let n = members.len();
+            format!("[{} {}]", n, if n == 1 { "item" } else { "items" })
+        }
+        Value::Array(items) => {
+            let n = items.len();
+            format!("[{} {}]", n, if n == 1 { "item" } else { "items" })
+        }
+        Value::Object(fields) => {
+            let n = fields.len();
+            // Use the full synthetic-object JSON, truncated; users
+            // scanning a results table want to see the field names.
+            let mut buf = String::with_capacity(2 + n * 16);
+            write_value_json(&mut buf, doc, v);
+            truncate(&buf, cap)
+        }
+        Value::BucketRow(fields) => {
+            // Skip the key field — the row's `path` already shows it.
+            let mut buf = String::new();
+            buf.push('{');
+            for (i, (k, val)) in fields.iter().skip(1).enumerate() {
+                if i > 0 {
+                    buf.push_str(", ");
+                }
+                buf.push('"');
+                escape_into(&mut buf, k);
+                buf.push_str("\": ");
+                write_value_json(&mut buf, doc, val);
+            }
+            buf.push('}');
+            truncate(&buf, cap)
+        }
+        Value::NamedValue { value, .. } => value_preview(doc, value, cap),
         Value::Node(id) => match doc.node_kind(*id) {
-            NodeKind::Null => "null".into(),
-            NodeKind::Bool => match doc.value_bytes(*id) {
-                Some(b"true") => "true".into(),
-                _ => "false".into(),
-            },
-            NodeKind::Number | NodeKind::String => doc
-                .value_bytes(*id)
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_default(),
             NodeKind::Array | NodeKind::Object => {
-                // Avoid recursing into source nodes here — their full
-                // bytes can be large. Render a compact placeholder
-                // that still tells the reader what they're looking at.
                 let count = doc.records()[*id as usize].child_count;
-                let kind = doc.node_kind(*id);
-                container_preview(kind, count)
+                container_preview(doc.node_kind(*id), count)
+            }
+            _ => {
+                let raw = doc
+                    .value_bytes(*id)
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .unwrap_or_default();
+                truncate(&raw, cap)
             }
         },
-    }
-}
-
-/// Best-effort `NodeKind` for a synthetic value when we need to label a
-/// row by its inner value's type (e.g. an unwrapped single-field
-/// object). `Value::Node` doesn't appear inside synthetic output trees
-/// in practice, but we fall through to `Object` for safety.
-fn inner_kind(v: &Value) -> NodeKind {
-    match v {
-        Value::Null | Value::Group { n: None, .. } => NodeKind::Null,
-        Value::Bool(_) => NodeKind::Bool,
-        Value::Number(_) | Value::Group { n: Some(_), .. } => NodeKind::Number,
-        Value::Str(_) => NodeKind::String,
-        Value::Object(_) | Value::BucketRow(_) | Value::NamedValue { .. } => NodeKind::Object,
-        Value::GroupList { .. } => NodeKind::Array,
-        Value::Node(_) => NodeKind::Object,
-    }
-}
-
-fn synthetic_result(s: &str, kind: NodeKind) -> QueryResult {
-    QueryResult {
-        node_id: NULL_NODE,
-        kind: kind_to_u8(kind),
-        path: format!("(synthetic) {}", truncate(s, 64)),
-        preview: truncate(s, 80),
-        full_text: s.to_string(),
+        _ => {
+            let mut buf = String::new();
+            write_value_json(&mut buf, doc, v);
+            truncate(&buf, cap)
+        }
     }
 }
 
@@ -230,7 +212,6 @@ fn truncate(s: &str, byte_limit: usize) -> String {
     if s.len() <= byte_limit {
         return s.to_string();
     }
-    // step back to a UTF-8 boundary
     let mut cut = byte_limit;
     while cut > 0 && !s.is_char_boundary(cut) {
         cut -= 1;
@@ -241,7 +222,7 @@ fn truncate(s: &str, byte_limit: usize) -> String {
     out
 }
 
-pub(super) fn kind_to_u8(kind: NodeKind) -> u8 {
+pub(crate) fn kind_to_u8(kind: NodeKind) -> u8 {
     match kind {
         NodeKind::Null => 0,
         NodeKind::Bool => 1,
@@ -264,6 +245,11 @@ pub(super) fn format_number(n: f64) -> String {
 
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    escape_into(&mut out, s);
+    out
+}
+
+fn escape_into(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -275,5 +261,4 @@ fn json_escape(s: &str) -> String {
             _ => out.push(c),
         }
     }
-    out
 }

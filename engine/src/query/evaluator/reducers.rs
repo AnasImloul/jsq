@@ -67,7 +67,7 @@ pub(super) fn to_number(doc: &Document, v: &Value) -> Option<f64> {
         Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
         Value::Group { n, .. } => n.and_then(|v| v.is_finite().then_some(v)),
         Value::GroupList { members, .. } => Some(members.len() as f64),
-        Value::Null | Value::Str(_) | Value::Object(_) | Value::BucketRow(_) | Value::NamedValue { .. } => None,
+        Value::Null | Value::Str(_) | Value::Object(_) | Value::BucketRow(_) | Value::NamedValue { .. } | Value::Array(_) => None,
         Value::Node(id) => {
             if doc.node_kind(*id) != NodeKind::Number {
                 return None;

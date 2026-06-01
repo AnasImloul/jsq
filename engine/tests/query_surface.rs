@@ -22,17 +22,17 @@ fn run_surface(doc: &Document, query: &str) -> Vec<String> {
     if let Some(err) = out.error {
         panic!("surface eval error: {:?}\nlowered AST: {}", err, ast);
     }
-    format_results(out.results)
+    format_results(doc, out.results)
 }
 
-fn format_results(rows: Vec<engine::query::evaluator::QueryResult>) -> Vec<String> {
+fn format_results(
+    doc: &Document,
+    rows: Vec<engine::query::evaluator::QueryResult>,
+) -> Vec<String> {
     rows.into_iter()
         .map(|r| {
-            let body = if !r.full_text.is_empty() && r.full_text.len() > r.preview.len() {
-                r.full_text
-            } else {
-                r.preview
-            };
+            let mut body = String::new();
+            engine::query::evaluator::render::write_value_json(&mut body, doc, &r.value);
             format!("{} → {}", r.path, body)
         })
         .collect()
@@ -77,7 +77,7 @@ fn cube_doc(test_name: &str) -> Document {
         }}}"#,
     );
     let doc = Document::open(&path, None).unwrap();
-    create_index(&doc, ".data.kpis.dimensions[*]", ".id");
+    create_index(&doc, ".data.kpis.dimensions[]", ".id");
     doc
 }
 
@@ -103,65 +103,75 @@ fn pattern_doc(test_name: &str) -> Document {
 fn q1_full_rollup_with_field_set() {
     let doc = cube_doc("q1");
     let q = r#"
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         where dim.{
             pay_category, flow, client, warehouse_id, cargo_type,
             work_type_id, worker_type, worker_role, worker_level,
             shift_schedule, shift_template_id,
         } == "*"
-        sum s.values.weight.total by s.granularity
+        aggregate { weight: sum(s.values.weight.total) } by s.granularity
     "#;
     // Only d6 has every rollup dim set to "*". Its series s7 (day,
     // 1000) and s8 (week, 7000) survive.
-    assert_eq!(
-        run_surface(&doc, q),
-        vec!["day → 1000", "week → 7000"]
-    );
+    let out = run_surface(&doc, q);
+    assert_eq!(out.len(), 2, "{:?}", out);
+    let day = out.iter().find(|r| r.starts_with("day → ")).unwrap();
+    assert!(day.contains("\"weight\": 1000"), "{}", day);
+    let week = out.iter().find(|r| r.starts_with("week → ")).unwrap();
+    assert!(week.contains("\"weight\": 7000"), "{}", week);
 }
 
 #[test]
 fn q2_single_slice_with_and_predicate() {
     let doc = cube_doc("q2");
     let q = r#"
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         where dim.warehouse_id == "wh_07" and dim.client == "acme"
-        sum s.values.weight.total by s.granularity
+        aggregate { weight: sum(s.values.weight.total) } by s.granularity
     "#;
-    assert_eq!(run_surface(&doc, q), vec!["day → 100", "week → 700"]);
+    let out = run_surface(&doc, q);
+    assert_eq!(out.len(), 2, "{:?}", out);
+    let day = out.iter().find(|r| r.starts_with("day → ")).unwrap();
+    assert!(day.contains("\"weight\": 100"), "{}", day);
+    let week = out.iter().find(|r| r.starts_with("week → ")).unwrap();
+    assert!(week.contains("\"weight\": 700"), "{}", week);
 }
 
 #[test]
 fn q3_in_membership() {
     let doc = cube_doc("q3");
     let q = r#"
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         where dim.warehouse_id in ["wh_01", "wh_07", "wh_12"]
           and dim.cargo_type == "frozen"
-        sum s.values.weight.total by s.granularity
+        aggregate { weight: sum(s.values.weight.total) } by s.granularity
     "#;
-    assert_eq!(run_surface(&doc, q), vec!["day → 11000"]);
+    let out = run_surface(&doc, q);
+    assert_eq!(out.len(), 1, "{:?}", out);
+    assert!(out[0].starts_with("day → "), "{}", out[0]);
+    assert!(out[0].contains("\"weight\": 11000"), "{}", out[0]);
 }
 
 #[test]
 fn q4_ne_and_not_in_with_multi_key() {
     let doc = cube_doc("q4");
     let q = r#"
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         where dim.client != "internal_test"
           and dim.warehouse_id not in ["wh_sandbox", "wh_qa"]
-        sum s.values.weight.total by s.granularity, dim.warehouse_id
+        aggregate { weight: sum(s.values.weight.total) } by s.granularity, dim.warehouse_id
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 6, "got {:?}", out);
     let joined: String = out.join("\n");
     for expected_n in ["100", "200", "700", "11000", "1000", "7000"] {
         assert!(
-            joined.contains(expected_n),
-            "expected bucket containing {} in {:?}",
+            joined.contains(&format!("\"weight\": {}", expected_n)),
+            "expected bucket containing weight={} in {:?}",
             expected_n,
             out
         );
@@ -172,21 +182,24 @@ fn q4_ne_and_not_in_with_multi_key() {
 fn q5_numeric_predicate_no_join() {
     let doc = cube_doc("q5");
     let q = r#"
-        from .data.kpis.series[*] as s
+        from .data.kpis.series[] as s
         where s.values.weight.total > 10000 and s.granularity == "day"
-        sum s.values.weight.total by s.granularity
+        aggregate { weight: sum(s.values.weight.total) } by s.granularity
     "#;
-    assert_eq!(run_surface(&doc, q), vec!["day → 11000"]);
+    let out = run_surface(&doc, q);
+    assert_eq!(out.len(), 1, "{:?}", out);
+    assert!(out[0].starts_with("day → "), "{}", out[0]);
+    assert!(out[0].contains("\"weight\": 11000"), "{}", out[0]);
 }
 
 #[test]
 fn join_canonical_form_hits_index() {
     let doc = cube_doc("smoke");
     let q = r#"
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         where dim.warehouse_id == "wh_07"
-        count by s.granularity
+        aggregate { n: count() } by s.granularity
     "#;
     let ast = surface::compile(q).expect("compile ok");
     let out = evaluator::run(&doc, &ast, 0, 5000);
@@ -199,33 +212,33 @@ fn join_canonical_form_hits_index() {
 }
 
 // ============================================================================
-// `let` field-set spread + override
+// `fields` macro field-set spread + override
 // ============================================================================
 
 #[test]
-fn let_field_set_spread_matches_inline() {
+fn fields_macro_spread_matches_inline() {
     let doc = cube_doc("spread");
     let inline = r#"
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         where dim.{
             pay_category, flow, client, warehouse_id, cargo_type,
             work_type_id, worker_type, worker_role, worker_level,
             shift_schedule, shift_template_id,
         } == "*"
-        sum s.values.weight.total by s.granularity
+        aggregate { weight: sum(s.values.weight.total) } by s.granularity
     "#;
     let spread = r#"
-        let rollup_dims = {
+        fields rollup_dims = {
             pay_category, flow, client, warehouse_id, cargo_type,
             work_type_id, worker_type, worker_role, worker_level,
             shift_schedule, shift_template_id,
         }
 
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         where dim.{...rollup_dims} == "*"
-        sum s.values.weight.total by s.granularity
+        aggregate { weight: sum(s.values.weight.total) } by s.granularity
     "#;
     let inline_out = run_surface(&doc, inline);
     let spread_out = run_surface(&doc, spread);
@@ -234,23 +247,23 @@ fn let_field_set_spread_matches_inline() {
 }
 
 #[test]
-fn let_field_set_spread_with_override() {
+fn fields_macro_spread_with_override() {
     let doc = cube_doc("override");
     let spread = r#"
-        let rollup_dims = {
+        fields rollup_dims = {
             pay_category, flow, client, warehouse_id, cargo_type,
             work_type_id, worker_type, worker_role, worker_level,
             shift_schedule, shift_template_id,
         }
 
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         where dim.{...rollup_dims, cargo_type: "frozen"} == "*"
-        sum s.values.weight.total by s.granularity
+        aggregate { weight: sum(s.values.weight.total) } by s.granularity
     "#;
     let inline = r#"
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         where dim.pay_category == "*"
           and dim.flow == "*"
           and dim.client == "*"
@@ -262,7 +275,7 @@ fn let_field_set_spread_with_override() {
           and dim.worker_level == "*"
           and dim.shift_schedule == "*"
           and dim.shift_template_id == "*"
-        sum s.values.weight.total by s.granularity
+        aggregate { weight: sum(s.values.weight.total) } by s.granularity
     "#;
     assert_eq!(run_surface(&doc, spread), run_surface(&doc, inline));
 }
@@ -275,8 +288,8 @@ fn let_field_set_spread_with_override() {
 fn select_projection_emits_synthetic_objects() {
     let doc = cube_doc("select");
     let q = r#"
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         where dim.warehouse_id in ["wh_01", "wh_07"]
         select {
             warehouse: dim.warehouse_id,
@@ -306,8 +319,8 @@ fn select_projection_emits_synthetic_objects() {
 fn select_with_missing_join_emits_null() {
     let doc = cube_doc("select_null");
     let q = r#"
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        left join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         select {
             day:       s.granularity,
             warehouse: dim.warehouse_id,
@@ -330,38 +343,38 @@ fn pattern_operators_starts_ends_contains_matches() {
 
     let starts = run_surface(
         &doc,
-        r#"from .items[*] as i where i.client starts_with "acme" select { c: i.client }"#,
+        r#"from .items[] as i where i.client starts_with "acme" select { c: i.client }"#,
     );
     assert_eq!(starts.len(), 3);
 
     let ends = run_surface(
         &doc,
-        r#"from .items[*] as i where i.warehouse ends_with "berlin" select { w: i.warehouse }"#,
+        r#"from .items[] as i where i.warehouse ends_with "berlin" select { w: i.warehouse }"#,
     );
     assert_eq!(ends.len(), 1);
     assert!(ends[0].contains("\"w\": \"wh_eu_berlin\""));
 
     let contains = run_surface(
         &doc,
-        r#"from .items[*] as i where i.warehouse contains "_us_" select { w: i.warehouse }"#,
+        r#"from .items[] as i where i.warehouse contains "_us_" select { w: i.warehouse }"#,
     );
     assert_eq!(contains.len(), 2);
 
     let matches = run_surface(
         &doc,
-        r#"from .items[*] as i where i.client matches "acme_*" select { c: i.client }"#,
+        r#"from .items[] as i where i.client matches "acme_*" select { c: i.client }"#,
     );
     assert_eq!(matches.len(), 2);
 
     let eu = run_surface(
         &doc,
-        r#"from .items[*] as i where i.warehouse matches "wh_eu_*" select { w: i.warehouse }"#,
+        r#"from .items[] as i where i.warehouse matches "wh_eu_*" select { w: i.warehouse }"#,
     );
     assert_eq!(eu.len(), 2);
 
     let two_letter = run_surface(
         &doc,
-        r#"from .items[*] as i where i.client matches "acme_??" select { c: i.client }"#,
+        r#"from .items[] as i where i.client matches "acme_??" select { c: i.client }"#,
     );
     assert_eq!(two_letter.len(), 2);
 }
@@ -374,12 +387,12 @@ fn pattern_operators_starts_ends_contains_matches() {
 fn order_by_desc_with_limit() {
     let doc = cube_doc("order_desc");
     let q = r#"
-        from .data.kpis.series[*] as s
+        from .data.kpis.series[] as s
         select {
             warehouse: s.dims_id,
             weight:    s.values.weight.total,
         }
-        order by weight desc
+        order by .weight desc
         limit 3
     "#;
     let out = run_surface(&doc, q);
@@ -395,9 +408,9 @@ fn order_by_desc_with_limit() {
 fn order_by_default_direction_is_ascending() {
     let doc = cube_doc("order_asc");
     let q = r#"
-        from .data.kpis.series[*] as s
+        from .data.kpis.series[] as s
         select { weight: s.values.weight.total }
-        order by weight
+        order by .weight
         limit 3
     "#;
     let out = run_surface(&doc, q);
@@ -413,12 +426,12 @@ fn order_by_default_direction_is_ascending() {
 fn order_by_multiple_keys_with_tiebreak() {
     let doc = cube_doc("order_multi");
     let q = r#"
-        from .data.kpis.series[*] as s
+        from .data.kpis.series[] as s
         select {
             g: s.granularity,
             w: s.values.weight.total,
         }
-        order by g asc, w desc
+        order by .g asc, .w desc
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 8);
@@ -468,7 +481,7 @@ fn extract_string(row: &str, field: &str) -> String {
 fn aggregate_block_multiple_reducers_by_key() {
     let doc = cube_doc("agg_block");
     let q = r#"
-        from .data.kpis.series[*] as s
+        from .data.kpis.series[] as s
         aggregate {
             total_weight:   sum(s.values.weight.total),
             shipment_count: count(),
@@ -496,8 +509,8 @@ fn aggregate_block_multiple_reducers_by_key() {
 fn aggregate_block_conditional_reducer_via_where() {
     let doc = cube_doc("agg_cond");
     let q = r#"
-        from .data.kpis.series[*] as s
-        join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+        from .data.kpis.series[] as s
+        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
         aggregate {
             frozen_weight: sum(s.values.weight.total) where dim.cargo_type == "frozen",
             total_weight:  sum(s.values.weight.total),
@@ -519,9 +532,9 @@ fn aggregate_block_conditional_reducer_via_where() {
 fn aggregate_block_then_order_then_limit() {
     let doc = cube_doc("agg_top1");
     let q = r#"
-        from .data.kpis.series[*] as s
+        from .data.kpis.series[] as s
         aggregate { weight: sum(s.values.weight.total) } by s.granularity
-        order by weight desc
+        order by .weight desc
         limit 1
     "#;
     let out = run_surface(&doc, q);
@@ -531,8 +544,64 @@ fn aggregate_block_then_order_then_limit() {
     assert!(row.contains("\"weight\": 12365"), "{}", row);
 }
 
+#[test]
+fn aggregate_block_rollup_emits_subtotals_and_grand_total() {
+    let path = write_tmp(
+        "engine_query_surface_rollup.json",
+        r#"{"sales":[
+            {"region":"west","product":"a","amount":10},
+            {"region":"west","product":"a","amount":5},
+            {"region":"west","product":"b","amount":7},
+            {"region":"east","product":"a","amount":3},
+            {"region":"east","product":"b","amount":9},
+            {"region":"east","product":"b","amount":1}
+        ]}"#,
+    );
+    let doc = Document::open(&path, None).unwrap();
+    let q = r#"
+        from .sales[] as s
+        aggregate { total: sum(s.amount), n: count() }
+        by rollup(s.region, s.product)
+    "#;
+    let out = run_surface(&doc, q);
+    // 4 detail rows (west/a, west/b, east/a, east/b) + 2 region subtotals
+    // + 1 grand total.
+    assert_eq!(out.len(), 7, "{:#?}", out);
+
+    // Detail level: both key columns carry a value.
+    let west_a = out
+        .iter()
+        .find(|r| r.contains("\"region\": \"west\", \"product\": \"a\""))
+        .unwrap();
+    assert!(west_a.contains("\"total\": 15"), "{}", west_a);
+    assert!(west_a.contains("\"n\": 2"), "{}", west_a);
+
+    // Region subtotal: the trailing `product` key rolls up to null.
+    let west_sub = out
+        .iter()
+        .find(|r| r.contains("\"region\": \"west\", \"product\": null"))
+        .unwrap();
+    assert!(west_sub.contains("\"total\": 22"), "{}", west_sub);
+    assert!(west_sub.contains("\"n\": 3"), "{}", west_sub);
+
+    let east_sub = out
+        .iter()
+        .find(|r| r.contains("\"region\": \"east\", \"product\": null"))
+        .unwrap();
+    assert!(east_sub.contains("\"total\": 13"), "{}", east_sub);
+    assert!(east_sub.contains("\"n\": 3"), "{}", east_sub);
+
+    // Grand total: every key column is null.
+    let grand = out
+        .iter()
+        .find(|r| r.contains("\"region\": null, \"product\": null"))
+        .unwrap();
+    assert!(grand.contains("\"total\": 35"), "{}", grand);
+    assert!(grand.contains("\"n\": 6"), "{}", grand);
+}
+
 // ============================================================================
-// aggregate each partition (new feature)
+// grouped aggregate over buckets (was the removed `partition`/`each` form)
 // ============================================================================
 
 fn partition_cube_doc(test_name: &str) -> Document {
@@ -549,104 +618,37 @@ fn partition_cube_doc(test_name: &str) -> Document {
     Document::open(&path, None).unwrap()
 }
 
+// Regression: the use case the removed `partition`/`aggregate each` form
+// served — per-bucket derived metrics — is still expressible with a
+// grouped `aggregate { ... } by KEY`.
 #[test]
-fn aggregate_each_partition_basic() {
+fn grouped_aggregate_derives_per_bucket_metrics() {
     let doc = partition_cube_doc("basic");
     let q = r#"
-        from .rows[*] as r
+        from .rows[] as r
         let fw = sum(r.forecast),
             bw = sum(r.baseline)
-        partition {
-            bup: r.cargo_type == "BUP",
-            loo: r.cargo_type == "LOO",
-            gen: r.cargo_type == "GEN"
-        }
-        aggregate each partition as p => p.name: {
+        aggregate {
             pct:    (fw - bw) / bw * 100,
             delta:  fw - bw
-        }
+        } by r.cargo_type
     "#;
     let out = run_surface(&doc, q);
-    // One row with three top-level keys.
+    // One row per cargo_type bucket.
     // BUP: fw=200, bw=200 → pct=0, delta=0
     // LOO: fw=110, bw=80  → pct=37.5, delta=30
     // GEN: fw=200, bw=250 → pct=-20, delta=-50
-    assert!(!out.is_empty(), "no rows: {:?}", out);
+    assert_eq!(out.len(), 3, "{:?}", out);
     let joined = out.join("\n");
-    assert!(joined.contains("bup"), "missing bup: {:?}", out);
-    assert!(joined.contains("loo"), "missing loo: {:?}", out);
-    assert!(joined.contains("gen"), "missing gen: {:?}", out);
+    assert!(joined.contains("BUP"), "missing BUP: {:?}", out);
+    assert!(joined.contains("LOO"), "missing LOO: {:?}", out);
+    assert!(joined.contains("GEN"), "missing GEN: {:?}", out);
     assert!(joined.contains("37.5"), "missing loo pct (37.5): {:?}", out);
     assert!(joined.contains("-50"), "missing gen delta (-50): {:?}", out);
 }
 
-#[test]
-fn aggregate_each_partition_requires_partition_block() {
-    let res = surface::compile(
-        r#"
-        from .rows[*] as r
-        aggregate each partition as p => p.name: { n: count() }
-        "#,
-    );
-    assert!(res.is_err());
-    let msg = format!("{:?}", res.err().unwrap());
-    assert!(
-        msg.contains("partition"),
-        "error should mention required partition block: {}",
-        msg
-    );
-}
-
-#[test]
-fn partition_block_without_each_partition_errors() {
-    let res = surface::compile(
-        r#"
-        from .rows[*] as r
-        partition { bup: r.cargo_type == "BUP" }
-        aggregate { n: count() }
-        "#,
-    );
-    assert!(res.is_err());
-    let msg = format!("{:?}", res.err().unwrap());
-    assert!(
-        msg.contains("partition"),
-        "error should mention unused partition block: {}",
-        msg
-    );
-}
-
-#[test]
-fn duplicate_partition_name_errors() {
-    let res = surface::compile(
-        r#"
-        from .rows[*] as r
-        partition {
-            bup: r.cargo_type == "BUP",
-            bup: r.cargo_type == "LOO"
-        }
-        aggregate each partition as p => p.name: { n: count() }
-        "#,
-    );
-    assert!(res.is_err());
-    let msg = format!("{:?}", res.err().unwrap());
-    assert!(msg.contains("duplicate") || msg.contains("bup"));
-}
-
-#[test]
-fn aggregate_each_partition_wrong_accessor_errors() {
-    // `p.foo` is illegal — only `p.name` is allowed.
-    let res = surface::compile(
-        r#"
-        from .rows[*] as r
-        partition { bup: r.cargo_type == "BUP" }
-        aggregate each partition as p => p.foo: { n: count() }
-        "#,
-    );
-    assert!(res.is_err());
-}
-
 // ============================================================================
-// distinct / group by / shorthand without by
+// distinct / collect by
 // ============================================================================
 
 #[test]
@@ -662,14 +664,14 @@ fn distinct_dedupes_a_stream() {
         ]}"#,
     );
     let doc = Document::open(&path, None).unwrap();
-    let rows = run_surface(&doc, "from .users[*] as u distinct select { r: u.role }");
+    let rows = run_surface(&doc, "from .users[] as u distinct select { r: u.role }");
     assert_eq!(rows.len(), 3, "{:?}", rows);
 }
 
 #[test]
-fn group_by_collects_members_per_bucket() {
+fn collect_by_collects_members_per_bucket() {
     let path = write_tmp(
-        "engine_query_group_by.json",
+        "engine_query_collect_by.json",
         r#"{"products":[
             {"id":1,"sku":"A","name":"apple"},
             {"id":2,"sku":"B","name":"banana"},
@@ -680,32 +682,64 @@ fn group_by_collects_members_per_bucket() {
         ]}"#,
     );
     let doc = Document::open(&path, None).unwrap();
-    let rows = run_surface(&doc, "from .products[*] as p group by p.sku");
+    let rows = run_surface(&doc, "from .products[] as p collect by p.sku");
     assert_eq!(rows.len(), 3);
-    assert!(rows[0].contains("A") && rows[0].contains("3 items"), "{:?}", rows[0]);
-    assert!(rows[1].contains("B") && rows[1].contains("2 items"), "{:?}", rows[1]);
-    assert!(rows[2].contains("C") && rows[2].contains("1 item"), "{:?}", rows[2]);
+    // Group buckets now render as real JSON arrays of their members
+    // — `jsq … | jq .` round-trips cleanly instead of bailing on a
+    // `[N items]` placeholder.
+    assert!(rows[0].starts_with("A → ["), "{:?}", rows[0]);
+    assert!(rows[0].contains("\"name\":\"apple\""), "{:?}", rows[0]);
+    assert!(rows[0].contains("\"name\":\"avocado\""), "{:?}", rows[0]);
+    assert!(rows[0].contains("\"name\":\"apricot\""), "{:?}", rows[0]);
+    assert!(rows[1].starts_with("B → ["), "{:?}", rows[1]);
+    assert!(rows[1].contains("\"name\":\"banana\""), "{:?}", rows[1]);
+    assert!(rows[1].contains("\"name\":\"blueberry\""), "{:?}", rows[1]);
+    assert!(rows[2].starts_with("C → ["), "{:?}", rows[2]);
+    assert!(rows[2].contains("\"name\":\"cherry\""), "{:?}", rows[2]);
 }
 
 #[test]
-fn aggregate_shorthand_without_by() {
+fn aggregate_block_no_by_emits_one_named_row() {
     let doc = cube_doc("agg_no_by");
-    let out = run_surface(&doc, "from .data.kpis.series[*] as s sum s.values.weight.total");
-    assert_eq!(out, vec!["(synthetic) 20065 → 20065"]);
+    let out = run_surface(
+        &doc,
+        "from .data.kpis.series[] as s aggregate { total: sum(s.values.weight.total) }",
+    );
+    assert_eq!(out, vec!["total → 20065"]);
 }
 
 #[test]
 fn aggregate_count_without_by_or_arg() {
     let doc = cube_doc("count_no_by");
-    let out = run_surface(&doc, "from .data.kpis.series[*] as s count");
-    assert_eq!(out, vec!["(synthetic) 8 → 8"]);
+    let out = run_surface(
+        &doc,
+        "from .data.kpis.series[] as s aggregate { n: count() }",
+    );
+    assert_eq!(out, vec!["n → 8"]);
+}
+
+#[test]
+fn bare_reducer_clause_is_rejected() {
+    // The `sum X` / `count` / `count by K` clause-level shorthand was
+    // removed — reducer calls now only exist inside an `aggregate { ... }`
+    // block. The error message must point users at the block form.
+    for q in [
+        "from .x[] as r sum r.v",
+        "from .x[] as r count",
+        "from .x[] as r count by r.k",
+        "from .x[] as r avg r.v by r.k",
+    ] {
+        let err = surface::compile(q).expect_err(q);
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("aggregate {"), "{}: {}", q, msg);
+    }
 }
 
 #[test]
 fn aggregate_block_without_by_emits_one_row_per_reduction() {
     let doc = cube_doc("agg_block_no_by");
     let q = r#"
-        from .data.kpis.series[*] as s
+        from .data.kpis.series[] as s
         aggregate {
             total: sum(s.values.weight.total),
             rows:  count(),
@@ -727,7 +761,7 @@ fn aggregate_block_without_by_emits_one_row_per_reduction() {
 fn aggregate_empty_distinguishes_no_values_from_zero() {
     let doc = cube_doc("agg_null");
     let q = r#"
-        from .data.kpis.series[*] as s
+        from .data.kpis.series[] as s
         where s.granularity == "monthly_unobtainable"
         aggregate {
             total:        sum(s.values.weight.total),
@@ -760,7 +794,7 @@ fn count_with_arg_skips_nulls() {
     );
     let doc = Document::open(&path, None).unwrap();
     let q = r#"
-        from .items[*] as it
+        from .items[] as it
         aggregate {
             rows:    count(),
             with_v:  count(it.v),
@@ -798,19 +832,19 @@ fn exists_distinguishes_missing_from_null() {
 
     let exists = run_surface(
         &doc,
-        r#"from .rows[*] as r where r.v exists select { id: r.id }"#,
+        r#"from .rows[] as r where r.v exists select { id: r.id }"#,
     );
     assert_eq!(exists.len(), 3);
 
     let non_null = run_surface(
         &doc,
-        r#"from .rows[*] as r where r.v != null select { id: r.id }"#,
+        r#"from .rows[] as r where r.v != null select { id: r.id }"#,
     );
     assert_eq!(non_null.len(), 2);
 
     let both = run_surface(
         &doc,
-        r#"from .rows[*] as r where r.v exists and r.v != null select { id: r.id }"#,
+        r#"from .rows[] as r where r.v exists and r.v != null select { id: r.id }"#,
     );
     assert_eq!(both.len(), 2);
 }
@@ -828,10 +862,10 @@ fn iteration_in_middle_of_path() {
     let doc = Document::open(&path, None).unwrap();
     let out = run_surface(
         &doc,
-        r#"from .data[*].series[*] as s where s.g == "day" count by s.g"#,
+        r#"from .data[].series[] as s where s.g == "day" aggregate { n: count() } by s.g"#,
     );
     assert_eq!(out.len(), 1);
-    assert!(out[0].contains("3"));
+    assert!(out[0].contains("\"n\": 3"), "{}", out[0]);
 }
 
 #[test]
@@ -848,13 +882,160 @@ fn recursive_descent_finds_all_matches() {
         }}"#,
     );
     let doc = Document::open(&path, None).unwrap();
-    let out = run_surface(&doc, r#"from .top.**.items[*] as item select { n: item.n }"#);
+    let out = run_surface(&doc, r#"from .top.**.items[] as item select { n: item.n }"#);
     assert_eq!(out.len(), 3, "{:?}", out);
     let nums: std::collections::HashSet<String> = out
         .iter()
         .map(|r| extract_int(r, "n"))
         .collect();
     assert!(nums.contains("1") && nums.contains("2") && nums.contains("3"));
+}
+
+fn unnest_doc(test_name: &str) -> Document {
+    let path = write_tmp(
+        &format!("engine_query_surface_unnest_{}.json", test_name),
+        r#"{"orders":[
+            {"id":1,"customer":"acme","items":["widget","gadget","gizmo"]},
+            {"id":2,"customer":"globex","items":["sprocket"]},
+            {"id":3,"customer":"initech","items":[]},
+            {"id":4,"customer":"hooli"}
+        ]}"#,
+    );
+    Document::open(&path, None).unwrap()
+}
+
+#[test]
+fn unnest_fans_out_one_row_per_array_element() {
+    let doc = unnest_doc("basic");
+    let out = run_surface(
+        &doc,
+        "from .orders[] as o unnest o.items as item \
+         select { id: o.id, item: item }",
+    );
+    // 3 (order 1) + 1 (order 2) = 4. Empty array (order 3) and missing
+    // field (order 4) drop their rows — inner semantics.
+    assert_eq!(out.len(), 4, "{:?}", out);
+    assert!(out.iter().any(|r| r.contains("\"id\": 1") && r.contains("\"item\": \"widget\"")));
+    assert!(out.iter().any(|r| r.contains("\"id\": 1") && r.contains("\"item\": \"gizmo\"")));
+    assert!(out.iter().any(|r| r.contains("\"id\": 2") && r.contains("\"item\": \"sprocket\"")));
+    assert!(!out.iter().any(|r| r.contains("\"id\": 3")), "{:?}", out);
+    assert!(!out.iter().any(|r| r.contains("\"id\": 4")), "{:?}", out);
+}
+
+#[test]
+fn unnest_feeds_downstream_aggregate() {
+    let doc = unnest_doc("agg");
+    let out = run_surface(
+        &doc,
+        "from .orders[] as o unnest o.items as item \
+         aggregate { n: count() } by o.customer",
+    );
+    // acme=3, globex=1; initech/hooli contribute no rows.
+    assert_eq!(out.len(), 2, "{:?}", out);
+    let acme = out.iter().find(|r| r.starts_with("acme → ")).unwrap();
+    assert!(acme.contains("\"n\": 3"), "{}", acme);
+    let globex = out.iter().find(|r| r.starts_with("globex → ")).unwrap();
+    assert!(globex.contains("\"n\": 1"), "{}", globex);
+}
+
+// ============================================================================
+// correlated subqueries
+// ============================================================================
+
+fn subquery_doc(test_name: &str) -> Document {
+    let path = write_tmp(
+        &format!("engine_query_surface_subquery_{}.json", test_name),
+        r#"{
+            "customers":[
+                {"id":1,"name":"acme"},
+                {"id":2,"name":"globex"},
+                {"id":3,"name":"initech"}
+            ],
+            "orders":[
+                {"cust_id":1,"total":50},
+                {"cust_id":1,"total":70},
+                {"cust_id":2,"total":30}
+            ]
+        }"#,
+    );
+    Document::open(&path, None).unwrap()
+}
+
+#[test]
+fn correlated_exists_keeps_matching_outer_rows() {
+    let doc = subquery_doc("exists");
+    let out = run_surface(
+        &doc,
+        "from .customers[] as c \
+         where (from .orders[] as o where o.cust_id == c.id) exists \
+         select { name: c.name }",
+    );
+    // acme (id 1) and globex (id 2) have orders; initech (id 3) does not.
+    assert_eq!(out.len(), 2, "{:?}", out);
+    assert!(out.iter().any(|r| r.contains("\"name\": \"acme\"")), "{:?}", out);
+    assert!(out.iter().any(|r| r.contains("\"name\": \"globex\"")), "{:?}", out);
+    assert!(!out.iter().any(|r| r.contains("initech")), "{:?}", out);
+}
+
+#[test]
+fn correlated_not_exists_keeps_unmatched_outer_rows() {
+    let doc = subquery_doc("not_exists");
+    let out = run_surface(
+        &doc,
+        "from .customers[] as c \
+         where not (from .orders[] as o where o.cust_id == c.id) exists \
+         select { name: c.name }",
+    );
+    // Only initech (id 3) has no orders.
+    assert_eq!(out.len(), 1, "{:?}", out);
+    assert!(out[0].contains("\"name\": \"initech\""), "{:?}", out);
+}
+
+#[test]
+fn membership_over_subquery_emissions() {
+    let doc = subquery_doc("in");
+    let out = run_surface(
+        &doc,
+        "from .customers[] as c \
+         where c.id in (from .orders[].cust_id as o) \
+         select { name: c.name }",
+    );
+    // Customer ids appearing in the orders' cust_id stream: 1 and 2.
+    assert_eq!(out.len(), 2, "{:?}", out);
+    assert!(out.iter().any(|r| r.contains("\"name\": \"acme\"")), "{:?}", out);
+    assert!(out.iter().any(|r| r.contains("\"name\": \"globex\"")), "{:?}", out);
+}
+
+#[test]
+fn scalar_subquery_in_projection() {
+    let doc = subquery_doc("scalar");
+    let out = run_surface(
+        &doc,
+        "from .customers[] as c \
+         select { name: c.name, \
+                  n: (from .orders[] as o where o.cust_id == c.id aggregate { n: count() }) }",
+    );
+    assert_eq!(out.len(), 3, "{:?}", out);
+    let acme = out.iter().find(|r| r.contains("\"name\": \"acme\"")).unwrap();
+    assert!(acme.contains("\"n\": 2"), "{}", acme);
+    let globex = out.iter().find(|r| r.contains("\"name\": \"globex\"")).unwrap();
+    assert!(globex.contains("\"n\": 1"), "{}", globex);
+    let initech = out.iter().find(|r| r.contains("\"name\": \"initech\"")).unwrap();
+    assert!(initech.contains("\"n\": 0"), "{}", initech);
+}
+
+#[test]
+fn subquery_formatter_roundtrips() {
+    let canonical = "\
+from .customers[] as c
+where (from .orders[] as o where o.cust_id == c.id) exists
+select {
+  name: c.name
+}";
+    let once = surface::format(canonical).expect("format ok");
+    assert_eq!(once, canonical);
+    let twice = surface::format(&once).expect("format ok");
+    assert_eq!(twice, once);
 }
 
 #[test]
@@ -877,16 +1058,16 @@ fn recursive_descent_with_predicate() {
     );
     let doc = Document::open(&path, None).unwrap();
     let q = r#"
-        from .org.**.employees[*] as e
+        from .org.**.employees[] as e
         where e.role == "manager"
-        count by e.department
+        aggregate { n: count() } by e.department
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 2);
     let sales = out.iter().find(|r| r.contains("sales")).unwrap();
-    assert!(sales.contains("2"));
+    assert!(sales.contains("\"n\": 2"), "{}", sales);
     let eng = out.iter().find(|r| r.contains("eng")).unwrap();
-    assert!(eng.contains("1"));
+    assert!(eng.contains("\"n\": 1"), "{}", eng);
 }
 
 #[test]
@@ -909,16 +1090,16 @@ fn iteration_with_field_set_predicate() {
     );
     let doc = Document::open(&path, None).unwrap();
     let q = r#"
-        from .regions[*].warehouses[*] as w
+        from .regions[].warehouses[] as w
         where w.{status, region_id} != null
-        count by w.region_id
+        aggregate { n: count() } by w.region_id
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 2);
     let us = out.iter().find(|r| r.contains("us")).unwrap();
-    assert!(us.contains("2"));
+    assert!(us.contains("\"n\": 2"), "{}", us);
     let eu = out.iter().find(|r| r.contains("eu")).unwrap();
-    assert!(eu.contains("1"));
+    assert!(eu.contains("\"n\": 1"), "{}", eu);
 }
 
 // ============================================================================
@@ -953,7 +1134,7 @@ fn type_test_matches_each_native_type() {
         ("object", vec!["f"]),
     ] {
         let q = format!(
-            r#"from .rows[*] as r where r.v is {} select {{ id: r.id }}"#,
+            r#"from .rows[] as r where r.v is {} select {{ id: r.id }}"#,
             kind
         );
         let out = run_surface(&doc, &q);
@@ -971,7 +1152,7 @@ fn type_test_negation_excludes_match() {
     let doc = mixed_types_doc("negation");
     let out = run_surface(
         &doc,
-        r#"from .rows[*] as r where r.v is not string select { id: r.id }"#,
+        r#"from .rows[] as r where r.v is not string select { id: r.id }"#,
     );
     let ids: Vec<String> = out
         .iter()
@@ -982,7 +1163,7 @@ fn type_test_negation_excludes_match() {
 
 #[test]
 fn type_test_unknown_kind_errors() {
-    let res = surface::compile(r#"from .rows[*] as r where r.v is widget"#);
+    let res = surface::compile(r#"from .rows[] as r where r.v is widget"#);
     assert!(res.is_err());
 }
 
@@ -996,7 +1177,7 @@ fn arithmetic_precedence_and_associativity() {
     let doc = Document::open(&path, None).unwrap();
     let rows = run_surface(
         &doc,
-        r#"from .rows[*] as r aggregate {
+        r#"from .rows[] as r aggregate {
               add_then_mul: sum(r.x) + sum(r.y) * sum(r.z),
               sub_left:     sum(r.x) - sum(r.y) - sum(r.z),
               parens:       (sum(r.x) - sum(r.y)) * sum(r.z),
@@ -1025,9 +1206,9 @@ fn arithmetic_in_where_predicate() {
         ]}"#,
     );
     let doc = Document::open(&path, None).unwrap();
-    let rows = run_surface(&doc, r#"from .rows[*] as r where r.x + r.y > 10 count"#);
+    let rows = run_surface(&doc, r#"from .rows[] as r where r.x + r.y > 10 aggregate { n: count() }"#);
     assert_eq!(rows.len(), 1);
-    assert!(rows[0].ends_with("2"));
+    assert_eq!(rows[0], "n → 2");
 }
 
 #[test]
@@ -1036,7 +1217,7 @@ fn divide_by_zero_with_default() {
     let doc = Document::open(&path, None).unwrap();
     let rows = run_surface(
         &doc,
-        r#"from .rows[*] as r aggregate {
+        r#"from .rows[] as r aggregate {
               ratio_raw:    sum(r.a) / sum(r.b),
               ratio_safe:   sum(r.a) / sum(r.b) ?? -1,
           }"#,
@@ -1047,7 +1228,7 @@ fn divide_by_zero_with_default() {
 #[test]
 fn reducer_deduplication_in_lowerer() {
     let ast = surface::compile(
-        r#"from .rows[*] as r aggregate { combined: sum(r.x) * 2 + sum(r.x) }"#,
+        r#"from .rows[] as r aggregate { combined: sum(r.x) * 2 + sum(r.x) }"#,
     )
     .expect("compile ok");
     let canon = ast.to_string();
@@ -1065,14 +1246,14 @@ fn arithmetic_unary_minus_on_reducer() {
     let doc = Document::open(&path, None).unwrap();
     let rows = run_surface(
         &doc,
-        r#"from .rows[*] as r aggregate { neg: -sum(r.x) }"#,
+        r#"from .rows[] as r aggregate { neg: -sum(r.x) }"#,
     );
     assert_eq!(rows, vec!["neg → -7"]);
 }
 
 #[test]
 fn reducer_outside_aggregate_block_errors() {
-    let res = surface::compile(r#"from .rows[*] as r where sum(r.x) > 5"#);
+    let res = surface::compile(r#"from .rows[] as r where sum(r.x) > 5"#);
     assert!(res.is_err());
     let msg = format!("{:?}", res.err().unwrap());
     assert!(msg.contains("aggregate"), "{}", msg);
@@ -1086,7 +1267,7 @@ fn reducer_outside_aggregate_block_errors() {
 fn alias_let_substitutes_into_aggregate_item() {
     let doc = partition_cube_doc("alias_only");
     let sugar = r#"
-        from .rows[*] as r
+        from .rows[] as r
         let fw = sum(r.forecast)
         aggregate {
             total: fw,
@@ -1094,7 +1275,7 @@ fn alias_let_substitutes_into_aggregate_item() {
         }
     "#;
     let direct = r#"
-        from .rows[*] as r
+        from .rows[] as r
         aggregate {
             total: sum(r.forecast),
             doubled: sum(r.forecast) * 2
@@ -1107,13 +1288,13 @@ fn alias_let_substitutes_into_aggregate_item() {
 fn alias_let_forward_chain() {
     let doc = partition_cube_doc("alias_chain");
     let sugar = r#"
-        from .rows[*] as r
+        from .rows[] as r
         let a = sum(r.forecast),
             b = a + 1
         aggregate { result: b }
     "#;
     let direct = r#"
-        from .rows[*] as r
+        from .rows[] as r
         aggregate { result: sum(r.forecast) + 1 }
     "#;
     assert_eq!(run_surface(&doc, sugar), run_surface(&doc, direct));
@@ -1123,7 +1304,7 @@ fn alias_let_forward_chain() {
 fn alias_let_shadowing_alias_errors() {
     let res = surface::compile(
         r#"
-        from .rows[*] as r
+        from .rows[] as r
         let r = sum(r.x)
         aggregate { x: r }
         "#,
@@ -1157,7 +1338,7 @@ fn round_defaults_to_integer() {
     let doc = numbers_doc("integer_default");
     let out = run_surface(
         &doc,
-        r#"from .rows[*] as r select { id: r.id, n: round(r.v) }"#,
+        r#"from .rows[] as r select { id: r.id, n: round(r.v) }"#,
     );
     let combined = out.join("\n");
     for snippet in &["\"n\": 1", "\"n\": 3", "\"n\": -2", "\"n\": 120", "\"n\": null"] {
@@ -1170,7 +1351,7 @@ fn round_with_precision() {
     let doc = numbers_doc("precision");
     let out = run_surface(
         &doc,
-        r#"from .rows[*] as r where r.id == "c" select { n: round(r.v, 2) }"#,
+        r#"from .rows[] as r where r.id == "c" select { n: round(r.v, 2) }"#,
     );
     assert_eq!(out.len(), 1);
     assert!(out[0].contains("3.14"));
@@ -1181,10 +1362,126 @@ fn round_inside_aggregate_hoists_reducer() {
     let doc = numbers_doc("hoist");
     let out = run_surface(
         &doc,
-        r#"from .rows[*] as r aggregate { total: round(sum(r.v), 1) }"#,
+        r#"from .rows[] as r aggregate { total: round(sum(r.v), 1) }"#,
     );
     let combined = out.join("\n");
     assert!(combined.contains("125.4"), "{:?}", out);
+}
+
+// ============================================================================
+// if() conditional
+// ============================================================================
+
+fn if_doc(test_name: &str) -> Document {
+    // Mix of booleans, numbers, strings, missing keys, and explicit
+    // nulls so the truthiness rule and missing-cond fallback can both
+    // be exercised.
+    let path = write_tmp(
+        &format!("engine_query_if_{}.json", test_name),
+        r#"{"rows":[
+            {"id":"a","flag":true,  "v":10},
+            {"id":"b","flag":false, "v":20},
+            {"id":"c","flag":null,  "v":30},
+            {"id":"d","flag":0,     "v":40},
+            {"id":"e","flag":"yes", "v":50},
+            {"id":"f",              "v":60}
+        ]}"#,
+    );
+    Document::open(&path, None).unwrap()
+}
+
+#[test]
+fn if_picks_then_when_cond_truthy() {
+    // jq truthiness: `0`, `""`, and even a missing-then-emitted value
+    // are all truthy. Only `false` and explicit `null` fall through to
+    // the else branch. A `cond` that emits nothing also falls through.
+    let doc = if_doc("truthy");
+    let out = run_surface(
+        &doc,
+        r#"from .rows[] as r select { id: r.id, pick: if(r.flag, "T", "F") }"#,
+    );
+    let combined = out.join("\n");
+    for (id, expected) in [
+        ("a", "T"), // true → T
+        ("b", "F"), // false → F
+        ("c", "F"), // null → F
+        ("d", "T"), // 0 is truthy (jq rule) → T
+        ("e", "T"), // "yes" → T
+        ("f", "F"), // missing key (no emission) → F
+    ] {
+        let row = out.iter().find(|r| r.contains(&format!("\"id\": \"{}\"", id))).unwrap();
+        assert!(
+            row.contains(&format!("\"pick\": \"{}\"", expected)),
+            "id={}: expected pick={}, got {}",
+            id, expected, row,
+        );
+        let _ = &combined;
+    }
+}
+
+#[test]
+fn if_branches_can_emit_paths() {
+    // The chosen branch's value is emitted as-is — branches don't have
+    // to be literals.
+    let doc = if_doc("paths");
+    let out = run_surface(
+        &doc,
+        r#"from .rows[] as r select { id: r.id, n: if(r.flag, r.v, -1) }"#,
+    );
+    let row_a = out.iter().find(|r| r.contains("\"id\": \"a\"")).unwrap();
+    assert!(row_a.contains("\"n\": 10"), "{}", row_a);
+    let row_b = out.iter().find(|r| r.contains("\"id\": \"b\"")).unwrap();
+    assert!(row_b.contains("\"n\": -1"), "{}", row_b);
+}
+
+#[test]
+fn if_inside_aggregate_hoists_reducers_from_both_branches() {
+    // Hoisting must reach both branches. Here the chosen branch
+    // depends on a count; the two reductions inside the arms should
+    // both be present in the lowered AST as separate slots.
+    let doc = if_doc("hoist");
+    let ast = surface::compile(
+        r#"from .rows[] as r aggregate {
+              picked: if(count() > 0, sum(r.v), -1)
+          }"#,
+    )
+    .expect("compile ok");
+    let canon = ast.to_string();
+    assert!(canon.contains("$slot(0)"), "{}", canon);
+    assert!(canon.contains("$slot(1)"), "{}", canon);
+    let out = evaluator::run(&doc, &ast, 0, 5000);
+    let rows = format_results(&doc, out.results);
+    assert_eq!(rows, vec!["picked → 210"]);
+}
+
+#[test]
+fn if_requires_three_arguments() {
+    for q in [
+        "from .x[] as r select { v: if(r.flag) }",
+        "from .x[] as r select { v: if(r.flag, 1) }",
+        "from .x[] as r select { v: if(r.flag, 1, 2, 3) }",
+    ] {
+        let err = surface::compile(q).expect_err(q);
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("if") || msg.contains("three arguments"),
+            "{}: {}",
+            q, msg,
+        );
+    }
+}
+
+#[test]
+fn if_formatter_roundtrips() {
+    let canonical = "\
+from .rows[] as r
+select {
+  v: if(r.flag, r.v, -1)
+}";
+    let once = surface::format(canonical).expect("format ok");
+    assert_eq!(once, canonical);
+    let twice = surface::format(&once).expect("format ok");
+    assert_eq!(twice, once);
 }
 
 // ============================================================================
@@ -1194,12 +1491,14 @@ fn round_inside_aggregate_hoists_reducer() {
 #[test]
 fn formatter_is_idempotent_on_canonical_input() {
     let canonical = "\
-from .data.kpis.series[*] as s
-join .data.kpis.dimensions[*] as dim
+from .data.kpis.series[] as s
+join .data.kpis.dimensions[] as dim
   on dim.id == s.dims_id
 where dim.warehouse_id == \"wh_07\"
 and dim.client == \"acme\"
-sum s.values.weight.total by s.granularity";
+aggregate {
+  weight: sum(s.values.weight.total)
+} by s.granularity";
     let once = surface::format(canonical).expect("format ok");
     assert_eq!(once, canonical);
     let twice = surface::format(&once).expect("format ok");
@@ -1208,32 +1507,54 @@ sum s.values.weight.total by s.granularity";
 
 #[test]
 fn formatter_normalises_messy_input() {
-    let messy = "from .data.kpis.series[*] as s join .data.kpis.dimensions[*] as dim on dim.id==s.dims_id where dim.warehouse_id==\"wh_07\" and dim.client==\"acme\" sum s.values.weight.total by s.granularity";
+    let messy = "from .data.kpis.series[] as s join .data.kpis.dimensions[] as dim on dim.id==s.dims_id where dim.warehouse_id==\"wh_07\" and dim.client==\"acme\" aggregate{weight:sum(s.values.weight.total)}by s.granularity";
     let formatted = surface::format(messy).expect("format ok");
     let expected = "\
-from .data.kpis.series[*] as s
-join .data.kpis.dimensions[*] as dim
+from .data.kpis.series[] as s
+join .data.kpis.dimensions[] as dim
   on dim.id == s.dims_id
 where dim.warehouse_id == \"wh_07\"
 and dim.client == \"acme\"
-sum s.values.weight.total by s.granularity";
+aggregate {
+  weight: sum(s.values.weight.total)
+} by s.granularity";
     assert_eq!(formatted, expected);
 }
 
 #[test]
-fn formatter_round_trips_aggregate_each_partition() {
+fn formatter_round_trips_collect_by() {
     let canonical = "\
-from .rows[*] as r
-let fw = sum(r.forecast),
-    bw = sum(r.baseline)
-partition {
-  bup: r.cargo_type == \"BUP\",
-  loo: r.cargo_type == \"LOO\"
+from .products[] as p
+collect by p.sku";
+    let once = surface::format(canonical).expect("format ok");
+    assert_eq!(once, canonical);
+    let twice = surface::format(&once).expect("format ok");
+    assert_eq!(twice, once);
 }
-aggregate each partition as p => p.name: {
-  pct: (fw - bw) / bw * 100,
-  delta: fw - bw
-}";
+
+#[test]
+fn formatter_round_trips_fields_macro() {
+    let canonical = "\
+fields core = {
+  name,
+  sku
+}
+
+from .products[] as p
+where p.{...core} != null";
+    let once = surface::format(canonical).expect("format ok");
+    assert_eq!(once, canonical);
+    let twice = surface::format(&once).expect("format ok");
+    assert_eq!(twice, once);
+}
+
+#[test]
+fn formatter_round_trips_rollup() {
+    let canonical = "\
+from .sales[] as s
+aggregate {
+  total: sum(s.amount)
+} by rollup(s.region, s.product)";
     let once = surface::format(canonical).expect("format ok");
     assert_eq!(once, canonical);
     let twice = surface::format(&once).expect("format ok");
@@ -1254,23 +1575,27 @@ fn hash_is_not_a_comment() {
 fn query_compile_runs_surface_end_to_end() {
     let doc = cube_doc("compile");
     let ast = query::compile(
-        r#"from .data.kpis.series[*] as s where s.granularity == "week" sum s.values.weight.total by s.granularity"#,
+        r#"from .data.kpis.series[] as s where s.granularity == "week" aggregate { weight: sum(s.values.weight.total) } by s.granularity"#,
     )
     .expect("compile ok");
     let out = evaluator::run(&doc, &ast, 0, 5000);
     assert!(out.error.is_none());
-    assert_eq!(format_results(out.results), vec!["week → 7700"]);
+    let formatted = format_results(&doc, out.results);
+    assert_eq!(formatted.len(), 1);
+    assert!(formatted[0].starts_with("week → "), "{}", formatted[0]);
+    assert!(formatted[0].contains("\"weight\": 7700"), "{}", formatted[0]);
 }
 
 #[test]
 fn scanned_rows_counts_source_emissions() {
     let doc = cube_doc("scanned");
-    let ast = query::compile("from .data.kpis.series[*] as s count").expect("compile ok");
+    let ast = query::compile("from .data.kpis.series[] as s aggregate { n: count() }")
+        .expect("compile ok");
     let out = evaluator::run(&doc, &ast, 0, 5000);
     assert_eq!(out.scanned_rows, 8);
 
     let ast = query::compile(
-        r#"from .data.kpis.series[*] as s where s.granularity == "week" count"#,
+        r#"from .data.kpis.series[] as s where s.granularity == "week" aggregate { n: count() }"#,
     )
     .expect("compile ok");
     let out = evaluator::run(&doc, &ast, 0, 5000);
@@ -1282,15 +1607,17 @@ fn scanned_rows_counts_source_emissions() {
 fn join_runs_one_lookup_per_row() {
     let doc = cube_doc("lookup_calls");
 
-    let ast = query::compile("from .data.kpis.series[*] as s count by s.granularity")
-        .expect("compile ok");
+    let ast = query::compile(
+        "from .data.kpis.series[] as s aggregate { n: count() } by s.granularity",
+    )
+    .expect("compile ok");
     let out = evaluator::run(&doc, &ast, 0, 5000);
     assert_eq!(out.lookup_calls, 0);
 
     let ast = query::compile(
         r#"
-            from .data.kpis.series[*] as s
-            join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+            from .data.kpis.series[] as s
+            join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
             select { wh: dim.warehouse_id }
         "#,
     )
@@ -1300,10 +1627,10 @@ fn join_runs_one_lookup_per_row() {
 
     let ast = query::compile(
         r#"
-            from .data.kpis.series[*] as s
-            join .data.kpis.dimensions[*] as dim on dim.id == s.dims_id
+            from .data.kpis.series[] as s
+            join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
             where dim.cargo_type == "*" and dim.client == "*"
-            count by s.granularity
+            aggregate { n: count() } by s.granularity
         "#,
     )
     .expect("compile ok");
@@ -1317,7 +1644,7 @@ fn join_runs_one_lookup_per_row() {
 
 #[test]
 fn query_must_start_with_from() {
-    let res = surface::compile(".rows[*] count");
+    let res = surface::compile(".rows[] aggregate { n: count() }");
     assert!(res.is_err());
     let msg = format!("{:?}", res.err().unwrap());
     assert!(msg.contains("from"), "{}", msg);
@@ -1325,7 +1652,7 @@ fn query_must_start_with_from() {
 
 #[test]
 fn source_alias_is_mandatory() {
-    let res = surface::compile("from .rows count");
+    let res = surface::compile("from .rows aggregate { n: count() }");
     assert!(res.is_err());
     let msg = format!("{:?}", res.err().unwrap());
     assert!(msg.contains("as"), "{}", msg);
@@ -1334,7 +1661,7 @@ fn source_alias_is_mandatory() {
 #[test]
 fn join_alias_is_mandatory() {
     let res = surface::compile(
-        "from .rows[*] as r join .other on .id == r.id count",
+        "from .rows[] as r join .other on .id == r.id aggregate { n: count() }",
     );
     assert!(res.is_err());
 }
@@ -1342,7 +1669,7 @@ fn join_alias_is_mandatory() {
 #[test]
 fn join_on_clause_is_mandatory() {
     let res = surface::compile(
-        "from .rows[*] as r join .other[*] as o count",
+        "from .rows[] as r join .other[] as o aggregate { n: count() }",
     );
     assert!(res.is_err());
     let msg = format!("{:?}", res.err().unwrap());
@@ -1354,9 +1681,9 @@ fn join_on_predicate_must_split_aliases() {
     // Both sides reference the new alias `o` — invalid.
     let res = surface::compile(
         r#"
-        from .rows[*] as r
-        join .other[*] as o on o.x == o.y
-        count
+        from .rows[] as r
+        join .other[] as o on o.x == o.y
+        aggregate { n: count() }
         "#,
     );
     assert!(res.is_err());
@@ -1364,14 +1691,14 @@ fn join_on_predicate_must_split_aliases() {
 
 #[test]
 fn alias_cannot_be_a_reserved_keyword() {
-    let res = surface::compile("from .rows[*] as where count");
+    let res = surface::compile("from .rows[] as where aggregate { n: count() }");
     assert!(res.is_err());
 }
 
 #[test]
 fn undefined_alias_in_path_errors() {
     let res = surface::compile(
-        r#"from .rows[*] as r where x.foo == 1 count"#,
+        r#"from .rows[] as r where x.foo == 1 aggregate { n: count() }"#,
     );
     assert!(res.is_err());
     let msg = format!("{:?}", res.err().unwrap());

@@ -14,20 +14,52 @@ pub mod kw {
     pub const FROM: &str = "from";
     /// Alias binder used by `from … as ALIAS` and `join … as ALIAS`.
     pub const AS: &str = "as";
-    /// Inner-join introducer: `join PATH as ALIAS on EXPR`.
+    /// Join introducer: `join PATH as ALIAS on EXPR`. Bare `join` is an
+    /// inner join (non-matching rows drop); `left join` keeps them with
+    /// the joined alias bound to null.
     pub const JOIN: &str = "join";
+    /// Explicit inner-join qualifier: `inner join …`. Same as bare `join`.
+    pub const INNER: &str = "inner";
+    /// Left-outer-join qualifier: `left join …`. Non-matching outer rows
+    /// survive with the joined alias bound to null.
+    pub const LEFT: &str = "left";
     /// Join-predicate keyword: `join … on LEFT == RIGHT`.
     pub const ON: &str = "on";
 
+    /// Array-flattening clause: `unnest EXPR as ALIAS`. For each upstream
+    /// row, iterates the array `EXPR` evaluates to and re-emits the row
+    /// once per element with `ALIAS` bound to that element. A missing,
+    /// empty, or non-array `EXPR` drops the row (inner semantics).
+    pub const UNNEST: &str = "unnest";
+
+    /// Field-set macro introducer: `fields NAME = { f1, f2, ... }`.
+    /// Compile-time only — declares a reusable set spread via `...NAME`
+    /// inside a field-set comparison.
+    pub const FIELDS: &str = "fields";
+    /// Aggregate-item alias introducer: `let NAME = EXPR`. Binds an
+    /// expression (typically reducer arithmetic) substituted into the
+    /// following `aggregate { ... }` block's items.
     pub const LET: &str = "let";
     pub const WHERE: &str = "where";
     pub const AGGREGATE: &str = "aggregate";
+    /// Post-aggregate filter: `aggregate { ... } [by KEY] having PRED`.
+    /// Like SQL `HAVING` — filters the reduced bucket-row stream,
+    /// referencing aggregate output fields by identity path (`.n > 10`).
+    pub const HAVING: &str = "having";
     pub const SELECT: &str = "select";
     pub const ORDER: &str = "order";
     pub const LIMIT: &str = "limit";
 
     pub const BY: &str = "by";
-    pub const GROUP: &str = "group";
+    /// Collect-mode grouping introducer: `collect by KEY`. Gathers all
+    /// rows per key into a member list (no reduction). Distinct from
+    /// `aggregate { ... } by KEY`, which reduces.
+    pub const COLLECT: &str = "collect";
+    /// Hierarchical grouping modifier: `aggregate { ... } by rollup(a, b)`.
+    /// Emits one grouping per key prefix — `(a, b)`, `(a)`, `()` — with the
+    /// rolled-up trailing key columns rendered as `null` (subtotals plus a
+    /// grand total). Only valid immediately after `by`.
+    pub const ROLLUP: &str = "rollup";
     pub const ASC: &str = "asc";
     pub const DESC: &str = "desc";
 
@@ -73,16 +105,43 @@ pub mod kw {
     /// places (negative precision rounds to tens/hundreds/…).
     pub const ROUND: &str = "round";
 
+    /// Conditional builtin. `if(COND, THEN, ELSE)` evaluates `COND`'s
+    /// first emission; if truthy (jq rule — only `null` and `false`
+    /// are falsy, everything else including `0` and `""` is truthy)
+    /// the result is whatever `THEN` emits, otherwise `ELSE`.
+    pub const IF: &str = "if";
+
+    /// `length(X)` — character count of a string, element count of an
+    /// array, key count of an object, `0` for null. Non-container
+    /// scalars (number / bool) yield null.
+    pub const LENGTH: &str = "length";
+    /// `lower(S)` / `upper(S)` — ASCII-aware case folding of a string.
+    pub const LOWER: &str = "lower";
+    pub const UPPER: &str = "upper";
+    /// `abs(N)` / `floor(N)` / `ceil(N)` — numeric helpers. Non-numeric
+    /// input yields null.
+    pub const ABS: &str = "abs";
+    pub const FLOOR: &str = "floor";
+    pub const CEIL: &str = "ceil";
+    /// `sqrt(N)` — square root; negative or non-numeric input yields null.
+    pub const SQRT: &str = "sqrt";
+    /// `pow(BASE, EXP)` — exponentiation. `mod(A, B)` — float remainder
+    /// (`B == 0` yields null). Both yield null on non-numeric input.
+    pub const POW: &str = "pow";
+    pub const MOD: &str = "mod";
+    /// `trim(S)` — strip leading/trailing ASCII whitespace.
+    pub const TRIM: &str = "trim";
+    /// `substr(S, START, LEN)` — codepoint-based substring. `START` is
+    /// clamped into range; negative `LEN` yields the empty string.
+    pub const SUBSTR: &str = "substr";
+    /// `replace(S, FROM, TO)` — replace every literal occurrence of
+    /// `FROM` in `S` with `TO`. Empty `FROM` returns `S` unchanged.
+    pub const REPLACE: &str = "replace";
+
     /// Stream-deduping clause. `SOURCE [where P] distinct …` emits each
     /// row at most once (by raw-byte equality on engine nodes,
     /// JSON-encoded form on synthetics).
     pub const DISTINCT: &str = "distinct";
-
-    /// Named-predicate block. `partition { name: PRED, ... }` declares
-    /// the buckets consumed by `aggregate each partition as p => p.name`.
-    pub const PARTITION: &str = "partition";
-    /// Iteration introducer: `aggregate each partition as p => p.name`.
-    pub const EACH: &str = "each";
 }
 
 /// Coarse category — drives highlighting style on the UI side and
@@ -130,21 +189,25 @@ impl Keyword {
 pub const KEYWORDS: &[Keyword] = &[
     // Clause introducers
     Keyword { text: kw::FROM,      category: KeywordCategory::Clause, role: KeywordRole::ValueStart },
+    Keyword { text: kw::FIELDS,    category: KeywordCategory::Clause, role: KeywordRole::ValueStart },
     Keyword { text: kw::JOIN,      category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
+    Keyword { text: kw::INNER,     category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
+    Keyword { text: kw::LEFT,      category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
     Keyword { text: kw::AS,        category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
     Keyword { text: kw::ON,        category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
+    Keyword { text: kw::UNNEST,    category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
     Keyword { text: kw::LET,       category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
     Keyword { text: kw::WHERE,     category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
-    Keyword { text: kw::PARTITION, category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
     Keyword { text: kw::AGGREGATE, category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
-    Keyword { text: kw::EACH,      category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
-    Keyword { text: kw::GROUP,     category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
+    Keyword { text: kw::COLLECT,   category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
+    Keyword { text: kw::HAVING,    category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
     Keyword { text: kw::SELECT,    category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
     Keyword { text: kw::ORDER,     category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
     Keyword { text: kw::LIMIT,     category: KeywordCategory::Clause, role: KeywordRole::AfterExpression },
 
     // Group-by / sort
-    Keyword { text: kw::BY,   category: KeywordCategory::Sort, role: KeywordRole::AfterExpression },
+    Keyword { text: kw::BY,     category: KeywordCategory::Sort, role: KeywordRole::AfterExpression },
+    Keyword { text: kw::ROLLUP, category: KeywordCategory::Sort, role: KeywordRole::AfterExpression },
     Keyword { text: kw::ASC,  category: KeywordCategory::Sort, role: KeywordRole::AfterExpression },
     Keyword { text: kw::DESC, category: KeywordCategory::Sort, role: KeywordRole::AfterExpression },
 
@@ -178,6 +241,19 @@ pub const KEYWORDS: &[Keyword] = &[
 
     // Built-in functions — parsed as special primaries
     Keyword { text: kw::ROUND,  category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::IF,     category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::LENGTH, category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::LOWER,  category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::UPPER,  category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::ABS,    category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::FLOOR,  category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::CEIL,   category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::SQRT,    category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::POW,     category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::MOD,     category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::TRIM,    category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::SUBSTR,  category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
+    Keyword { text: kw::REPLACE, category: KeywordCategory::Builtin, role: KeywordRole::ValueStart },
 
     // Pipeline transformer — appears as a clause after `where`/joins
     // and before `partition`/`aggregate`; never starts a query.
@@ -198,6 +274,37 @@ pub fn keyword_category(text: &str) -> Option<KeywordCategory> {
     keyword(text).map(|k| k.category)
 }
 
+/// A strict scalar function callable as `name(arg, ...)`. Every argument
+/// collapses to its first emission before the function runs, so these are
+/// distinct from the lazy `if(...)` builtin (which has its own node) and
+/// the reducers (which fold a stream). `round` lives here too — it is an
+/// ordinary strict function, not a special case.
+pub struct FunctionSpec {
+    pub name: &'static str,
+    pub min_args: usize,
+    pub max_args: usize,
+}
+
+pub const FUNCTIONS: &[FunctionSpec] = &[
+    FunctionSpec { name: kw::ROUND,  min_args: 1, max_args: 2 },
+    FunctionSpec { name: kw::LENGTH, min_args: 1, max_args: 1 },
+    FunctionSpec { name: kw::LOWER,  min_args: 1, max_args: 1 },
+    FunctionSpec { name: kw::UPPER,  min_args: 1, max_args: 1 },
+    FunctionSpec { name: kw::ABS,    min_args: 1, max_args: 1 },
+    FunctionSpec { name: kw::FLOOR,  min_args: 1, max_args: 1 },
+    FunctionSpec { name: kw::CEIL,   min_args: 1, max_args: 1 },
+    FunctionSpec { name: kw::SQRT,    min_args: 1, max_args: 1 },
+    FunctionSpec { name: kw::POW,     min_args: 2, max_args: 2 },
+    FunctionSpec { name: kw::MOD,     min_args: 2, max_args: 2 },
+    FunctionSpec { name: kw::TRIM,    min_args: 1, max_args: 1 },
+    FunctionSpec { name: kw::SUBSTR,  min_args: 3, max_args: 3 },
+    FunctionSpec { name: kw::REPLACE, min_args: 3, max_args: 3 },
+];
+
+pub fn function(name: &str) -> Option<&'static FunctionSpec> {
+    FUNCTIONS.iter().find(|f| f.name == name)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperatorKind {
     Eq,
@@ -206,7 +313,7 @@ pub enum OperatorKind {
     Le,
     Gt,
     Ge,
-    /// Bare `=`. Used by `with NAME = expr` and `let NAME = {…}`.
+    /// Bare `=`. Used by `fields NAME = {…}` and `let NAME = expr`.
     Assign,
     Add,
     Sub,
@@ -255,8 +362,6 @@ pub enum PunctKind {
     RParen,
     Star,
     StarStar,
-    /// `=>` — body introducer for `aggregate each partition as p => …`.
-    FatArrow,
 }
 
 pub struct PunctSpec {
@@ -264,11 +369,10 @@ pub struct PunctSpec {
     pub kind: PunctKind,
 }
 
-/// Order matters: `**`/`??`/`=>` come before `*`/`?` for greedy matching.
+/// Order matters: `**`/`??` come before `*`/`?` for greedy matching.
 pub const PUNCTUATION: &[PunctSpec] = &[
     PunctSpec { text: "**", kind: PunctKind::StarStar },
     PunctSpec { text: "??", kind: PunctKind::QuestionQuestion },
-    PunctSpec { text: "=>", kind: PunctKind::FatArrow },
     PunctSpec { text: ".",  kind: PunctKind::Dot },
     PunctSpec { text: "[",  kind: PunctKind::LBrack },
     PunctSpec { text: "]",  kind: PunctKind::RBrack },
@@ -443,7 +547,6 @@ fn punct_kind_str(k: PunctKind) -> &'static str {
         PunctKind::RParen => "rparen",
         PunctKind::Star => "star",
         PunctKind::StarStar => "starStar",
-        PunctKind::FatArrow => "fatArrow",
     }
 }
 

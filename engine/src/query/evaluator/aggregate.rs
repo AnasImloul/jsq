@@ -7,9 +7,10 @@ use std::collections::HashMap;
 
 use crate::document::Document;
 
-use super::super::ast::{AggGroup, AggOutputNode, AggReduction, Ast, ReducerOp};
+use super::super::ast::{AggGroup, AggGroupKey, AggOutputNode, AggReduction, Ast, ReducerOp};
 use super::super::index::ScalarKey;
 use super::super::value::Value;
+use super::fingerprint::value_to_group_key;
 use super::reducers::ReducerState;
 use super::walk::{first_emission, walk};
 use super::{pop_reducer_slots, push_reducer_slots};
@@ -37,6 +38,10 @@ pub(super) fn run_aggregate_block(
     input: Value,
     sink: &mut dyn FnMut(Value) -> bool,
 ) -> bool {
+    if let Some(AggGroup::Rollup(keys)) = group {
+        return run_rollup_block(doc, upstream, keys, reductions, outputs, input, sink);
+    }
+    // From here on `group` is either `None` or `Single`.
     let mut single_bucket: Option<AggregateBucket> = group
         .is_none()
         .then(|| AggregateBucket::new(reductions, None));
@@ -71,10 +76,10 @@ fn process_aggregate_row(
     buckets: &mut HashMap<ScalarKey, AggregateBucket>,
 ) {
     let bucket = match (group, single_bucket.as_mut()) {
-        (Some(g), _) => {
+        (Some(AggGroup::Single { key, .. }), _) => {
             let mut key_sk: Option<ScalarKey> = None;
             let mut key_val: Option<Value> = None;
-            walk(doc, &g.key, row.clone(), &mut |v| {
+            walk(doc, key, row.clone(), &mut |v| {
                 if key_sk.is_none() {
                     if let Some(sk) = ScalarKey::from_value(doc, &v) {
                         key_sk = Some(sk);
@@ -92,9 +97,23 @@ fn process_aggregate_row(
                 .or_insert_with(|| AggregateBucket::new(reductions, Some(key_val)))
         }
         (None, Some(b)) => b,
-        (None, None) => return, // shouldn't happen in well-formed callers
+        // Rollup is dispatched away before this point; a None group with
+        // no synthetic bucket can't occur in a well-formed caller.
+        _ => return,
     };
 
+    apply_reductions(doc, reductions, &row, &mut bucket.states);
+}
+
+/// Folds one upstream `row` into every reduction's state. Shared by the
+/// single/no-`by` path and the rollup path — the per-reducer `where`
+/// gate and the count/value op dispatch are identical across both.
+fn apply_reductions(
+    doc: &Document,
+    reductions: &[AggReduction],
+    row: &Value,
+    states: &mut [ReducerState],
+) {
     for (i, red) in reductions.iter().enumerate() {
         if let Some(pred) = &red.where_pred {
             let mut keep = false;
@@ -110,24 +129,24 @@ fn process_aggregate_row(
         }
         match (&red.value, red.op) {
             (None, ReducerOp::Count) => {
-                bucket.states[i].count += 1;
+                states[i].count += 1;
             }
             (Some(v_expr), ReducerOp::Count) => {
                 walk(doc, v_expr, row.clone(), &mut |v| {
                     if !matches!(v, Value::Null) {
-                        bucket.states[i].count += 1;
+                        states[i].count += 1;
                     }
                     true
                 });
             }
             (Some(v_expr), op) => {
                 walk(doc, v_expr, row.clone(), &mut |v| {
-                    bucket.states[i].consume(doc, op, &v);
+                    states[i].consume(doc, op, &v);
                     true
                 });
             }
             (None, _) => {
-                bucket.states[i].consume(doc, red.op, &row);
+                states[i].consume(doc, red.op, row);
             }
         }
     }
@@ -144,7 +163,7 @@ fn emit_no_by(
     bucket: AggregateBucket,
     sink: &mut dyn FnMut(Value) -> bool,
 ) -> bool {
-    let slots = finalize_slots(reductions, &bucket);
+    let slots = finalize_slots(reductions, &bucket.states);
     push_reducer_slots(slots);
     let result = (|| {
         for (name, node) in outputs {
@@ -187,7 +206,10 @@ fn emit_bucketed(
     buckets: HashMap<ScalarKey, AggregateBucket>,
     sink: &mut dyn FnMut(Value) -> bool,
 ) -> bool {
-    let key_name = group.map(|g| g.name.as_str()).unwrap_or("key");
+    let key_name = match group {
+        Some(AggGroup::Single { name, .. }) => name.as_str(),
+        _ => "key",
+    };
     // Sort by typed `ScalarKey`; see the same pattern in
     // `reducers::run_by_reducer` for why this avoids a per-bucket
     // render up-front.
@@ -198,7 +220,7 @@ fn emit_bucketed(
         if let Some(kv) = bucket.key_value.clone() {
             fields.push((key_name.to_string(), kv));
         }
-        let slots = finalize_slots(reductions, &bucket);
+        let slots = finalize_slots(reductions, &bucket.states);
         push_reducer_slots(slots);
         for (name, node) in outputs {
             let resolved = evaluate_output_node(doc, node);
@@ -212,15 +234,101 @@ fn emit_bucketed(
     true
 }
 
+/// `by rollup(k1, …, kN)`: one bucket set per key prefix. We keep `N + 1`
+/// bucket maps — level `L` groups by the first `L` keys — and fold each
+/// upstream row into all of them in a single pass. Level `N` holds the
+/// full-detail rows, level `0` the single grand-total bucket, and the
+/// levels between hold the subtotals. Emission runs most-detailed first
+/// (level `N` down to `0`); on a subtotal row the rolled-up trailing key
+/// columns render as `null`.
+fn run_rollup_block(
+    doc: &Document,
+    upstream: &Ast,
+    keys: &[AggGroupKey],
+    reductions: &[AggReduction],
+    outputs: &[(String, AggOutputNode)],
+    input: Value,
+    sink: &mut dyn FnMut(Value) -> bool,
+) -> bool {
+    let k = keys.len();
+    // One map per rollup level, 0..=k.
+    let mut levels: Vec<HashMap<ScalarKey, RollupBucket>> =
+        (0..=k).map(|_| HashMap::new()).collect();
+
+    walk(doc, upstream, input, &mut |row| {
+        // First emission of each key; a key with no emission drops the row
+        // from every level (matching the single-key "missing key" rule).
+        let mut vals: Vec<Value> = Vec::with_capacity(k);
+        for key in keys {
+            match first_emission(doc, &key.key, row.clone()) {
+                Some(v) => vals.push(v),
+                None => return true,
+            }
+        }
+        // Prefix string is built incrementally: level L reuses level L-1's
+        // string plus the next key, U+001F-joined like `Ast::KeyTuple`.
+        let mut prefix = String::new();
+        for level in 0..=k {
+            if level > 0 {
+                if level > 1 {
+                    prefix.push('\u{1F}');
+                }
+                prefix.push_str(&value_to_group_key(doc, &vals[level - 1]));
+            }
+            let sk = ScalarKey::Str(prefix.clone());
+            let bucket = levels[level].entry(sk).or_insert_with(|| RollupBucket {
+                key_values: vals[..level].to_vec(),
+                states: (0..reductions.len()).map(|_| ReducerState::default()).collect(),
+            });
+            apply_reductions(doc, reductions, &row, &mut bucket.states);
+        }
+        true
+    });
+
+    let key_names: Vec<&str> = keys.iter().map(|kk| kk.name.as_str()).collect();
+    for level in (0..=k).rev() {
+        let map = std::mem::take(&mut levels[level]);
+        let mut entries: Vec<(ScalarKey, RollupBucket)> = map.into_iter().collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (_sk, bucket) in entries {
+            let mut fields: Vec<(String, Value)> = Vec::with_capacity(k + outputs.len());
+            for (i, name) in key_names.iter().enumerate() {
+                let v = if i < level {
+                    bucket.key_values[i].clone()
+                } else {
+                    Value::Null
+                };
+                fields.push((name.to_string(), v));
+            }
+            let slots = finalize_slots(reductions, &bucket.states);
+            push_reducer_slots(slots);
+            for (name, node) in outputs {
+                fields.push((name.clone(), evaluate_output_node(doc, node)));
+            }
+            pop_reducer_slots();
+            if !sink(Value::BucketRow(fields)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+struct RollupBucket {
+    /// The prefix key values for this bucket — length equals the level.
+    key_values: Vec<Value>,
+    states: Vec<ReducerState>,
+}
+
 /// Pre-finalises every reduction's state into an `Option<f64>` slot.
 /// `None` means the reducer saw no inputs; the surface lowerer never
 /// generates a non-numeric reducer, so the slot type is always
 /// numeric.
-fn finalize_slots(reductions: &[AggReduction], bucket: &AggregateBucket) -> Vec<Option<f64>> {
+fn finalize_slots(reductions: &[AggReduction], states: &[ReducerState]) -> Vec<Option<f64>> {
     reductions
         .iter()
         .enumerate()
-        .map(|(i, red)| bucket.states[i].finalize_optional(red.op))
+        .map(|(i, red)| states[i].finalize_optional(red.op))
         .collect()
 }
 

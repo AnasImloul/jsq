@@ -28,6 +28,8 @@ pub enum TokenKind {
     /// following `.field` match anywhere in it.
     StarStar,
     Ident(String),
+    /// `$name` query parameter reference.
+    Param(String),
     Str(String),
     Number(f64),
     Eq,
@@ -36,10 +38,9 @@ pub enum TokenKind {
     Le,
     Gt,
     Ge,
-    /// Bare `=`. Used by the surface parser for `let NAME = expr`.
+    /// Bare `=`. Used by the surface parser for `fields NAME = {…}` and
+    /// `let NAME = expr`.
     Assign,
-    /// `=>` — body introducer for `aggregate each partition as p => …`.
-    FatArrow,
     /// Binary `+`. Arithmetic only — no unary plus form is recognised.
     Plus,
     /// Binary `-`. Emitted when the prior token can end a value
@@ -71,6 +72,7 @@ impl TokenKind {
             TokenKind::Star => "*".into(),
             TokenKind::StarStar => "**".into(),
             TokenKind::Ident(s) => format!("‘{}’", s),
+            TokenKind::Param(s) => format!("‘${}’", s),
             TokenKind::Str(s) => format!("string “{}”", s),
             TokenKind::Number(n) => format!("number {}", n),
             TokenKind::Eq => "==".into(),
@@ -80,7 +82,6 @@ impl TokenKind {
             TokenKind::Gt => ">".into(),
             TokenKind::Ge => ">=".into(),
             TokenKind::Assign => "=".into(),
-            TokenKind::FatArrow => "=>".into(),
             TokenKind::Plus => "+".into(),
             TokenKind::Minus => "-".into(),
             TokenKind::Slash => "/".into(),
@@ -148,16 +149,11 @@ impl Lexer {
                 }
                 '=' => {
                     self.pos += 1;
-                    match self.peek() {
-                        Some('=') => {
-                            self.pos += 1;
-                            TokenKind::Eq
-                        }
-                        Some('>') => {
-                            self.pos += 1;
-                            TokenKind::FatArrow
-                        }
-                        _ => TokenKind::Assign,
+                    if self.peek() == Some('=') {
+                        self.pos += 1;
+                        TokenKind::Eq
+                    } else {
+                        TokenKind::Assign
                     }
                 }
                 '!' => self.match_double('=', TokenKind::Ne, "expected '!=' (got bare '!')")?,
@@ -191,6 +187,7 @@ impl Lexer {
                         TokenKind::Minus
                     }
                 }
+                '$' => self.read_param(start)?,
                 c if c.is_ascii_digit() => self.read_number(start)?,
                 c if c.is_alphabetic() || c == '_' => self.read_ident(),
                 _ => return Err(QueryError::new(start, format!("unexpected character ‘{}’", ch))),
@@ -217,6 +214,7 @@ impl Lexer {
 fn prev_can_end_value(tok: Option<&Token>) -> bool {
     match tok.map(|t| &t.kind) {
         Some(TokenKind::Ident(_))
+        | Some(TokenKind::Param(_))
         | Some(TokenKind::Number(_))
         | Some(TokenKind::Str(_))
         | Some(TokenKind::RParen)
@@ -263,6 +261,21 @@ impl Lexer {
             }
         }
         TokenKind::Ident(self.chars[start..self.pos].iter().collect())
+    }
+
+    fn read_param(&mut self, start: usize) -> Result<TokenKind, QueryError> {
+        self.pos += 1; // consume `$`
+        let name_start = self.pos;
+        if !matches!(self.peek(), Some(c) if c.is_alphabetic() || c == '_') {
+            return Err(QueryError::new(
+                start,
+                "expected a parameter name after ‘$’".into(),
+            ));
+        }
+        while matches!(self.peek(), Some(c) if c.is_alphanumeric() || c == '_') {
+            self.pos += 1;
+        }
+        Ok(TokenKind::Param(self.chars[name_start..self.pos].iter().collect()))
     }
 
     fn read_number(&mut self, start: usize) -> Result<TokenKind, QueryError> {
@@ -522,6 +535,23 @@ impl UiScanner {
                 continue;
             }
 
+            // Query parameter `$name`. A lone `$` (or `$` followed by a
+            // non-identifier char) still emits an Identifier-categorised
+            // token so the highlighter keeps painting as the user types.
+            if c == '$' {
+                self.advance_one();
+                while self
+                    .chars
+                    .get(self.pos)
+                    .map(|n| n.is_alphanumeric() || *n == '_')
+                    .unwrap_or(false)
+                {
+                    self.advance_one();
+                }
+                out.push(self.token(TokenCategory::Identifier, start_utf16));
+                continue;
+            }
+
             // Splat — `**` first so the longer match wins.
             if c == '*' {
                 self.advance_one();
@@ -532,11 +562,10 @@ impl UiScanner {
                 continue;
             }
 
-            // Multi-char operators. `=` may be followed by `=` (Eq) or
-            // `>` (FatArrow body-introducer used by `aggregate each …`).
+            // Multi-char operators. `=` may be followed by `=` (Eq).
             if c == '=' {
                 self.advance_one();
-                if matches!(self.chars.get(self.pos), Some('=') | Some('>')) {
+                if self.chars.get(self.pos) == Some(&'=') {
                     self.advance_one();
                 }
                 out.push(self.token(TokenCategory::Operator, start_utf16));

@@ -5,14 +5,14 @@
 use super::super::ast::CompareOp;
 
 /// Top-level surface query. Clauses appear in pipeline order
-/// (`from → join* → where → let* → distinct → partition → aggregate
+/// (`fields* → from → join* → where → let* → distinct → aggregate
 /// → select → order by → limit`).
 #[derive(Clone, Debug)]
 pub struct Query {
-    /// `let NAME = { f1, f2, ... }` declarations at the top of the
+    /// `fields NAME = { f1, f2, ... }` declarations at the top of the
     /// query. Compile-time only: resolved during lowering, never make
     /// it into the engine AST.
-    pub lets: Vec<LetBinding>,
+    pub field_sets: Vec<FieldSetDef>,
     /// `from PATH as ALIAS` — mandatory source clause. The path is
     /// implicitly iterated (SQL `FROM table` semantics); the alias
     /// binds each emitted row.
@@ -23,6 +23,11 @@ pub struct Query {
     /// referencing the new alias and the other referencing prior
     /// aliases.
     pub joins: Vec<JoinClause>,
+    /// `unnest EXPR as ALIAS` — zero or more array fan-out clauses,
+    /// applied after the joins and before `where`. Each binds `ALIAS` to
+    /// successive elements of the array `EXPR`, emitting one row per
+    /// element (an empty / non-array `EXPR` drops the row).
+    pub unnests: Vec<UnnestClause>,
     pub where_clause: Option<Predicate>,
     /// `distinct` clause — when present, the pipeline emits each row
     /// at most once after `where` filters.
@@ -31,11 +36,12 @@ pub struct Query {
     /// arbitrary expression (typically reducer arithmetic) substituted
     /// into each aggregate item at lowering time.
     pub alias_lets: Vec<AliasLet>,
-    /// `partition { name: PRED, ... }` — named row buckets consumed by
-    /// `aggregate each partition as p => p.name`. Each partition's
-    /// predicate is fused into the matching aggregate item's `where`.
-    pub partitions: Vec<PartitionDef>,
     pub aggregate: Option<AggregateClause>,
+    /// `having PRED` — post-aggregate filter over the reduced bucket-row
+    /// stream. References aggregate output fields by identity path
+    /// (`.n`, `.total`). Only meaningful with an `aggregate { ... }`
+    /// clause present.
+    pub having: Option<Predicate>,
     /// `select { name: expr, ... }`.
     pub project: Option<Vec<(String, Expr)>>,
     pub order_by: Vec<OrderKey>,
@@ -49,20 +55,30 @@ pub struct SourceClause {
     pub alias: String,
 }
 
-/// `join PATH as ALIAS on LEFT == RIGHT`.
+/// Inner (`join` / `inner join`) drops outer rows with no match; left
+/// (`left join`) keeps them with the joined alias bound to null.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
+/// `[inner|left] join PATH as ALIAS on LEFT == RIGHT`.
 #[derive(Clone, Debug)]
 pub struct JoinClause {
     pub path: PathExpr,
     pub alias: String,
     pub on: Predicate,
+    pub kind: JoinKind,
 }
 
-/// One entry inside `partition { ... }`. `name` keys the bucket; `pred`
-/// is the row-level predicate that selects rows into it.
+/// `unnest EXPR as ALIAS`. `expr` evaluates (per upstream row) to the
+/// array being flattened; `alias` binds each element for downstream
+/// clauses.
 #[derive(Clone, Debug)]
-pub struct PartitionDef {
-    pub name: String,
-    pub pred: Expr,
+pub struct UnnestClause {
+    pub expr: Expr,
+    pub alias: String,
 }
 
 #[derive(Clone, Debug)]
@@ -71,9 +87,10 @@ pub struct OrderKey {
     pub desc: bool,
 }
 
-/// `let NAME = { f1, f2, ... }` — names a reusable field set.
+/// `fields NAME = { f1, f2, ... }` — names a reusable field set spread
+/// via `...NAME` inside a field-set comparison. Compile-time only.
 #[derive(Clone, Debug)]
-pub struct LetBinding {
+pub struct FieldSetDef {
     pub name: String,
     pub fields: Vec<String>,
 }
@@ -91,16 +108,12 @@ pub struct AliasLet {
 /// Aggregate clause variants. Mutually exclusive per query.
 #[derive(Clone, Debug)]
 pub enum AggregateClause {
-    /// `sum EXPR by K1, K2, ...` — single reducer, multi-key allowed.
-    Shorthand(AggregateShorthand),
     /// `aggregate { name: REDUCER [where P] [?? D], ... } [by KEY]` —
     /// multiple named reductions over the upstream rows.
     Block(AggregateBlock),
-    /// `group by KEY` — collect-mode grouping.
+    /// `collect by KEY` — collect-mode grouping (gather members, no
+    /// reduction).
     Group(GroupClause),
-    /// `aggregate each partition as ALIAS => ALIAS.name: { OBJECT }` —
-    /// one item per declared partition, body shared.
-    EachPartition(EachPartitionClause),
 }
 
 #[derive(Clone, Debug)]
@@ -109,16 +122,17 @@ pub struct GroupClause {
 }
 
 #[derive(Clone, Debug)]
-pub struct AggregateShorthand {
-    pub op: AggOp,
-    pub arg: Option<Expr>,
-    pub group_by: Vec<Expr>,
-}
-
-#[derive(Clone, Debug)]
 pub struct AggregateBlock {
     pub reductions: Vec<AggBlockItem>,
-    pub group_by: Option<Expr>,
+    /// `by KEY[, KEY ...]`. Empty when no `by` clause is present;
+    /// length 2+ is lowered to an `Ast::KeyTuple` so the engine sees
+    /// a single composite key (unless `rollup` is set — see below).
+    pub group_by: Vec<Expr>,
+    /// `by rollup(KEY, ...)`. When set, the keys in `group_by` form a
+    /// rollup hierarchy: the engine emits one grouping per key prefix
+    /// (full detail, each subtotal, and the grand total) instead of a
+    /// single composite group. Rolled-up trailing keys render as `null`.
+    pub rollup: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -134,22 +148,6 @@ pub struct AggBlockItem {
     /// `?? DEFAULT` — fallback expression evaluated when `output`
     /// returns null.
     pub default: Option<Expr>,
-}
-
-/// `aggregate each partition as p => p.name: { BODY }`. The body is
-/// applied once per declared partition; the partition's predicate
-/// becomes the resulting item's `where` and the partition's name is
-/// the item's output key.
-#[derive(Clone, Debug)]
-pub struct EachPartitionClause {
-    /// The identifier in `as ALIAS` (e.g. `"p"`). Used only to validate
-    /// the `ALIAS.name` accessor in the body — lowering substitutes any
-    /// `ALIAS.name` path with a string literal of the current partition's
-    /// name.
-    pub partition_alias: String,
-    /// The object expression on the RHS of `p.name:` — the per-partition
-    /// output shape.
-    pub body: Expr,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -188,7 +186,7 @@ pub enum PathRoot {
 pub enum PathSeg {
     Field(String),
     Index(i64),
-    /// `[*]` — emit each immediate child. Only iteration form
+    /// `[]` — emit each immediate child. Only iteration form
     /// in the surface language.
     Iterate,
     /// `.**` — recursive descent including the node itself.
@@ -213,7 +211,13 @@ pub enum FieldSetItem {
 pub enum Expr {
     Path(PathExpr),
     Lit(Lit),
-    /// Array literal — currently only used as the RHS of `in` / `not in`.
+    /// Query parameter `$name`. Replaced with a literal value at lowering
+    /// time from the caller-supplied parameter map; an unbound parameter
+    /// is a compile error.
+    Param(String),
+    /// Array literal `[e1, e2, ...]`. Lowers to `Ast::ArrayLit` as a
+    /// general expression, and is also matched directly as the RHS of
+    /// `in` / `not in` (membership expansion).
     Array(Vec<Expr>),
 
     /// Field-set comparison sugar: `BASE.{f1, f2, ...} OP RHS`.
@@ -263,10 +267,33 @@ pub enum Expr {
         negated: bool,
     },
 
-    /// `round(VALUE)` / `round(VALUE, PRECISION)`.
-    Round {
-        value: Box<Expr>,
-        precision: Option<Box<Expr>>,
+    /// Strict scalar function call — `name(arg, ...)`. Covers `round`,
+    /// `length`, `lower`, `upper`, `abs`, `floor`, `ceil`, … (see
+    /// `grammar::FUNCTIONS`). Arity is validated at parse time. The lazy
+    /// `if(...)` builtin is a separate variant since it must not evaluate
+    /// all of its arguments.
+    Call(String, Vec<Expr>),
+
+    /// Correlated subquery — a parenthesised full query used in an
+    /// expression position: `( from … )`. The inner query runs against
+    /// the document root, but may reference the enclosing query's
+    /// `from`/`join`/`unnest` aliases (correlation). Composes with
+    /// `exists` (correlated existence), `in` (membership over the
+    /// subquery's emissions), comparison, and `select` (scalar subquery
+    /// — first emission wins).
+    Subquery(Box<Query>),
+
+    /// `if(COND, THEN, ELSE)`. Evaluates `cond`'s first emission; if
+    /// truthy (jq rule: only `null` / `false` are falsy) the result is
+    /// `then_branch`, otherwise `else_branch`. Both branches are
+    /// allowed to emit a stream — the chosen branch's emissions flow
+    /// downstream unchanged. Reducer calls inside any of the three
+    /// arms hoist normally when this expression appears in an
+    /// aggregate-block output position.
+    If {
+        cond: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
     },
 }
 

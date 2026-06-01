@@ -20,7 +20,7 @@ use super::scan::{
 use super::sort::run_sort_by;
 use super::{
     binding_get, binding_set, bump_lookup_calls, bump_scanned_bytes, bump_scanned_rows,
-    lookup_resolved, outer_limit,
+    doc_root, lookup_resolved, outer_limit,
     reducer_slot_value, set_eval_error, EvalError, ResolvedIndex,
 };
 
@@ -189,37 +189,25 @@ pub(super) fn walk(
             walk(doc, l, input, &mut |mid| walk(doc, r, mid, sink))
         }
 
-        Ast::Round { value, precision } => {
-            // Both args collapse to their first emission, matching how
-            // `Binary` and `Neg` treat operands. Non-numeric inputs
-            // produce null; null precision defaults to 0 (integer
-            // rounding). Negative precision rounds to tens / hundreds.
-            let v = to_number(doc, first_emission(doc, value, input.clone()));
-            let p_raw = match precision {
-                Some(p) => to_number(doc, first_emission(doc, p, input)),
-                None => Some(0.0),
+        Ast::Call { name, args } => {
+            // Each argument collapses to its first emission (missing
+            // emission → null), then the named function runs once.
+            let evaluated: Vec<Option<Value>> = args
+                .iter()
+                .map(|a| first_emission(doc, a, input.clone()))
+                .collect();
+            sink(super::functions::call(doc, name, &evaluated))
+        }
+
+        Ast::If { cond, then_branch, else_branch } => {
+            // First emission of `cond` decides the branch. No emission
+            // is treated as falsy. Truthiness uses the jq rule (see
+            // `Value::is_truthy`): only Null and Bool(false) are falsy.
+            let chosen = match first_emission(doc, cond, input.clone()) {
+                Some(v) if v.is_truthy(doc) => then_branch,
+                _ => else_branch,
             };
-            let result: Option<f64> = match (v, p_raw) {
-                (Some(x), Some(p)) if p.is_finite() => {
-                    // Clamp precision to a sane range so 10^p stays
-                    // representable. f64 mantissa has ~15-16 digits;
-                    // beyond that the multiply/divide round-trip
-                    // loses what little precision the user asked for.
-                    let p_int = p.round() as i32;
-                    let clamped = p_int.clamp(-308, 308);
-                    let factor = 10f64.powi(clamped);
-                    if factor.is_finite() && factor != 0.0 {
-                        Some((x * factor).round() / factor)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            match result {
-                Some(n) if n.is_finite() => sink(Value::Number(n)),
-                _ => sink(Value::Null),
-            }
+            walk(doc, chosen, input, sink)
         }
 
         Ast::TypeTest { value, kind, negated } => {
@@ -302,6 +290,73 @@ pub(super) fn walk(
         // can offer to build it.
         Ast::Lookup { source_canon, key_canon, .. } => {
             run_lookup(doc, source_canon, key_canon, input, sink)
+        }
+
+        // Fan-out join. Resolve the join key from the current row, drive
+        // the inner `Lookup` with it, and for each matched node bind the
+        // alias and re-emit the original row — one downstream row per
+        // match. On zero matches, an inner join drops the row; a left
+        // join binds the alias to null and emits once.
+        Ast::JoinEach { alias, outer_key, lookup, inner } => {
+            let mut matched = false;
+            let mut stopped = false;
+            if let Some(key_val) = first_emission(doc, outer_key, input.clone()) {
+                walk(doc, lookup, key_val, &mut |node| {
+                    matched = true;
+                    binding_set(alias, node);
+                    if sink(input.clone()) {
+                        true
+                    } else {
+                        stopped = true;
+                        false
+                    }
+                });
+            }
+            if stopped {
+                return false;
+            }
+            if !matched {
+                if *inner {
+                    return true;
+                }
+                binding_set(alias, Value::Null);
+                return sink(input);
+            }
+            true
+        }
+
+        // Array fan-out. Resolve `source` against the current row; when
+        // it is an array, bind `alias` to each element and re-emit the
+        // original row once per element. A missing / non-array / empty
+        // source emits nothing (inner semantics — the row drops).
+        Ast::UnnestEach { alias, source } => {
+            match first_emission(doc, source, input.clone()) {
+                Some(Value::Node(id)) if matches!(doc.node_kind(id), NodeKind::Array) => {
+                    let mut stopped = false;
+                    scan_iterate(doc, id, &mut |elem| {
+                        binding_set(alias, elem);
+                        if sink(input.clone()) {
+                            true
+                        } else {
+                            stopped = true;
+                            false
+                        }
+                    });
+                    if stopped {
+                        return false;
+                    }
+                }
+                Some(Value::Array(items)) => {
+                    for elem in items {
+                        binding_set(alias, elem);
+                        if !sink(input.clone()) {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            true
         }
 
         // Postfix `EXPR exists` — true iff EXPR emits at least one
@@ -467,6 +522,29 @@ pub(super) fn walk(
             }
             sink(Value::Str(joined))
         }
+
+        // Correlated subquery. Ignores the current pipeline input and
+        // re-roots the inner pipeline at the document root, forwarding
+        // every emission to the parent sink. The outer row's aliases are
+        // still live in the binding map (no scope pop), so a correlated
+        // predicate inside `pipeline` reads them via `Ast::Var`. The
+        // lowerer guarantees the inner query's own aliases can't collide
+        // with an outer alias name, so the inner `Let` stages never
+        // clobber a binding the outer still needs.
+        Ast::Subquery { pipeline } => {
+            walk(doc, pipeline, Value::Node(doc_root()), sink)
+        }
+
+        // Array construction. Each element collapses to its first
+        // emission (missing emissions render as null), preserving order.
+        Ast::ArrayLit(items) => {
+            let mut out: Vec<Value> = Vec::with_capacity(items.len());
+            for item in items {
+                let v = first_emission(doc, item, input.clone()).unwrap_or(Value::Null);
+                out.push(v);
+            }
+            sink(Value::Array(out))
+        }
     }
 }
 
@@ -548,7 +626,7 @@ fn value_kind_matches(
         Value::Str(_) => K::String,
         Value::Group { n: Some(_), .. } => K::Number,
         Value::Group { n: None, .. } => K::Null,
-        Value::GroupList { .. } => K::Array,
+        Value::GroupList { .. } | Value::Array(_) => K::Array,
         Value::Object(_) => K::Object,
         Value::BucketRow(_) => K::Object,
         Value::NamedValue { value, .. } => return value_kind_matches(doc, value, kind),

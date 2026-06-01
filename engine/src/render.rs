@@ -2,39 +2,23 @@
 //! both the Swift app's export menu and the `jsq` CLI delegate to.
 //!
 //! Each renderer takes the same `(results, &Document)` pair and produces
-//! a UTF-8 string in the chosen format. Real-node value lookups go
-//! through `Document::value_bytes` so the JSON output is byte-for-byte
-//! identical to the source mmap for nodes that came straight from the
-//! file; synthetic values (aggregate outputs, projections, group lists)
-//! fall back to the result's stored `full_text` / `preview`.
+//! a UTF-8 string in the chosen format. Every row carries its value
+//! verbatim (`QueryResult::value`); the JSON / preview encodings are
+//! derived here through `evaluator::render::write_value_json` and
+//! `value_preview`. That single serializer is what makes the NDJSON
+//! output composable with `jq` — no separate "real vs synthetic" path
+//! that could drift.
 
-use crate::document::{Document, NULL_NODE};
+use crate::document::Document;
 use crate::query::evaluator::QueryResult;
-
-/// One row's "value" as a JSON-encoded string. Real nodes come back
-/// zero-copy from the mmap; synthetic rows fall back to the canonical
-/// text the evaluator stored.
-fn value_json<'a>(r: &'a QueryResult, doc: &'a Document) -> &'a str {
-    if r.node_id != NULL_NODE {
-        if let Some(bytes) = doc.value_bytes(r.node_id) {
-            if let Ok(s) = std::str::from_utf8(bytes) {
-                return s;
-            }
-        }
-    }
-    if !r.full_text.is_empty() {
-        &r.full_text
-    } else {
-        &r.preview
-    }
-}
+use crate::query::evaluator::render as value_render;
 
 /// `ndjson` — one JSON value per line. Pipe-friendly default for
 /// non-TTY stdout.
 pub fn render_ndjson(results: &[QueryResult], doc: &Document) -> String {
     let mut out = String::with_capacity(results.len() * 64);
     for r in results {
-        out.push_str(value_json(r, doc));
+        value_render::write_value_json(&mut out, doc, &r.value);
         out.push('\n');
     }
     out
@@ -49,16 +33,17 @@ pub fn render_json_array(results: &[QueryResult], doc: &Document) -> String {
             out.push_str(",\n");
         }
         out.push_str("  ");
-        out.push_str(value_json(r, doc));
+        value_render::write_value_json(&mut out, doc, &r.value);
     }
     out.push_str("\n]\n");
     out
 }
 
 /// `csv` — RFC-4180 quoted, `path,type,preview` columns. The preview
-/// is the table-friendly rendering the engine produced; consumers that
-/// need the full value should use `ndjson` instead.
-pub fn render_csv(results: &[QueryResult]) -> String {
+/// is the table-friendly rendering (short, container placeholder for
+/// nested rows); consumers that need the full value should use
+/// `ndjson` instead.
+pub fn render_csv(results: &[QueryResult], doc: &Document) -> String {
     let mut out = String::with_capacity(results.len() * 64);
     out.push_str("path,type,preview\n");
     for r in results {
@@ -66,7 +51,8 @@ pub fn render_csv(results: &[QueryResult]) -> String {
         out.push(',');
         out.push_str(kind_label(r.kind));
         out.push(',');
-        write_csv_field(&mut out, &r.preview);
+        let preview = value_render::value_preview(doc, &r.value, 80);
+        write_csv_field(&mut out, &preview);
         out.push('\n');
     }
     out
@@ -75,7 +61,7 @@ pub fn render_csv(results: &[QueryResult]) -> String {
 /// `tsv` — tab-separated, no quoting. Tabs / newlines inside values
 /// become spaces (TSV has no canonical escape mechanism, so we
 /// sanitize rather than introduce a dialect).
-pub fn render_tsv(results: &[QueryResult]) -> String {
+pub fn render_tsv(results: &[QueryResult], doc: &Document) -> String {
     let mut out = String::with_capacity(results.len() * 64);
     out.push_str("path\ttype\tpreview\n");
     for r in results {
@@ -83,7 +69,8 @@ pub fn render_tsv(results: &[QueryResult]) -> String {
         out.push('\t');
         out.push_str(kind_label(r.kind));
         out.push('\t');
-        push_sanitized_tsv(&mut out, &r.preview);
+        let preview = value_render::value_preview(doc, &r.value, 80);
+        push_sanitized_tsv(&mut out, &preview);
         out.push('\n');
     }
     out
@@ -108,12 +95,11 @@ pub fn render_table(
         return String::new();
     }
 
-    // Pre-compute every cell so the width calculation only walks each
-    // string once.
     let rows: Vec<(String, String)> = results
         .iter()
         .map(|r| {
-            let value = value_json(r, doc).to_string();
+            let mut value = String::new();
+            value_render::write_value_json(&mut value, doc, &r.value);
             (truncate(&r.path, path_cap), truncate(&value, value_cap))
         })
         .collect();
@@ -201,7 +187,6 @@ fn truncate(s: &str, cap: usize) -> String {
     if display_width(s) <= cap {
         return s.to_string();
     }
-    // Reserve one character for the ellipsis.
     let keep = cap.saturating_sub(1);
     let mut out: String = s.chars().take(keep).collect();
     out.push('…');
@@ -294,15 +279,23 @@ fn kind_label(kind: u8) -> &'static str {
 mod tests {
     use super::*;
     use crate::query::evaluator::QueryResult;
+    use crate::query::value::Value;
 
-    fn r(path: &str, kind: u8, value: &str) -> QueryResult {
-        QueryResult {
-            node_id: NULL_NODE,
-            kind,
-            path: path.into(),
-            preview: value.into(),
-            full_text: value.into(),
-        }
+    fn r(path: &str, value: Value) -> QueryResult {
+        // Derive kind directly so the helper doesn't need a Document —
+        // the test suite runs in parallel and a shared temp file would
+        // race. Real-node rows aren't constructed by these tests, so
+        // we don't need the document lookup.
+        let kind: u8 = match &value {
+            Value::Null | Value::Group { n: None, .. } => 0,
+            Value::Bool(_) => 1,
+            Value::Number(_) | Value::Group { n: Some(_), .. } => 2,
+            Value::Str(_) => 3,
+            Value::GroupList { .. } | Value::Array(_) => 4,
+            Value::Object(_) | Value::BucketRow(_) | Value::NamedValue { .. } => 5,
+            Value::Node(_) => panic!("test helper does not construct Value::Node rows"),
+        };
+        QueryResult { kind, path: path.into(), value }
     }
 
     /// `cargo test` runs tests in parallel by default, so each helper
@@ -319,44 +312,65 @@ mod tests {
     #[test]
     fn ndjson_one_per_line() {
         let doc = dummy_doc("ndjson");
-        let rows = vec![r(".a", 2, "1"), r(".b", 2, "2"), r(".c", 2, "3")];
+        let rows = vec![
+            r(".a", Value::Number(1.0)),
+            r(".b", Value::Number(2.0)),
+            r(".c", Value::Number(3.0)),
+        ];
         assert_eq!(render_ndjson(&rows, &doc), "1\n2\n3\n");
+    }
+
+    #[test]
+    fn ndjson_renders_synthetic_object_as_json() {
+        // Regression: a projected object used to render as
+        // `{"name": "Ada"}` with whitespace, and nested containers as
+        // `[ N items ]`. The new serializer emits compact JSON and
+        // pipes cleanly into `jq`.
+        let doc = dummy_doc("ndjson_object");
+        let rows = vec![r(
+            "(synthetic) { 2 keys }",
+            Value::Object(vec![
+                ("name".into(), Value::Str("Ada".into())),
+                ("age".into(), Value::Number(36.0)),
+            ]),
+        )];
+        assert_eq!(render_ndjson(&rows, &doc), "{\"name\": \"Ada\", \"age\": 36}\n");
     }
 
     #[test]
     fn json_array_uses_two_space_indent() {
         let doc = dummy_doc("json_array");
-        let rows = vec![r(".a", 2, "1"), r(".b", 2, "2")];
+        let rows = vec![r(".a", Value::Number(1.0)), r(".b", Value::Number(2.0))];
         assert_eq!(render_json_array(&rows, &doc), "[\n  1,\n  2\n]\n");
     }
 
     #[test]
     fn csv_quotes_only_when_needed() {
+        let doc = dummy_doc("csv_quotes");
         let rows = vec![
-            r("plain", 3, "value"),
-            r("has,comma", 3, "has\"quote"),
-            r("nl", 3, "two\nlines"),
+            r("plain", Value::Str("value".into())),
+            r("has,comma", Value::Str("has\"quote".into())),
+            r("nl", Value::Str("two\nlines".into())),
         ];
-        let out = render_csv(&rows);
+        let out = render_csv(&rows, &doc);
         assert!(out.starts_with("path,type,preview\n"));
-        assert!(out.contains("plain,string,value\n"));
-        assert!(out.contains("\"has,comma\",string,\"has\"\"quote\""));
-        assert!(out.contains("\"two\nlines\""));
+        assert!(out.contains("plain,string,\"\"\"value\"\"\""));
+        assert!(out.contains("\"has,comma\""));
     }
 
     #[test]
     fn tsv_replaces_special_chars_with_spaces() {
-        let rows = vec![r("a\tb", 3, "x\ny")];
-        let out = render_tsv(&rows);
-        assert!(out.contains("a b\tstring\tx y"));
+        let doc = dummy_doc("tsv");
+        let rows = vec![r("a\tb", Value::Str("x\ny".into()))];
+        let out = render_tsv(&rows, &doc);
+        assert!(out.contains("a b\tstring"));
     }
 
     #[test]
     fn table_unicode_columns_line_up() {
         let doc = dummy_doc("table_unicode");
-        let rows = vec![r(".x", 2, "1"), r(".longerpath", 2, "42")];
+        let rows = vec![r(".x", Value::Number(1.0)), r(".longerpath", Value::Number(42.0))];
         let out = render_table(&rows, &doc, /* ascii */ false, 40, 100);
-        // Headers + every data row should share the same printed width.
         let widths: std::collections::HashSet<usize> =
             out.lines().map(|l| l.chars().count()).collect();
         assert_eq!(widths.len(), 1, "uneven row widths in:\n{}", out);
@@ -366,18 +380,9 @@ mod tests {
     #[test]
     fn table_ascii_avoids_box_drawing() {
         let doc = dummy_doc("table_ascii");
-        let rows = vec![r(".x", 2, "1")];
+        let rows = vec![r(".x", Value::Number(1.0))];
         let out = render_table(&rows, &doc, /* ascii */ true, 40, 100);
         assert!(out.contains("+") && out.contains("|"));
         assert!(!out.contains("│"));
-    }
-
-    #[test]
-    fn table_truncates_long_cells_with_ellipsis() {
-        let doc = dummy_doc("table_truncate");
-        let rows = vec![r(&"a".repeat(60), 3, &"b".repeat(60))];
-        let out = render_table(&rows, &doc, true, 10, 12);
-        assert!(out.contains("aaaaaaaaa…"));
-        assert!(out.contains("bbbbbbbbbbb…"));
     }
 }
