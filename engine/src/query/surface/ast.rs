@@ -166,7 +166,7 @@ pub type Predicate = Expr;
 
 /// Path with a root and a list of segments. Roots are either the
 /// document `.` (Identity) or a bare identifier referencing a `from` /
-/// `join` alias (`s`, `s.warehouse_id`).
+/// `join` alias (`s`, `s.book_id`).
 #[derive(Clone, Debug)]
 pub struct PathExpr {
     pub root: PathRoot,

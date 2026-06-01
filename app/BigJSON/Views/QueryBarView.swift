@@ -35,7 +35,7 @@ struct QueryBarView: View {
                     text: $store.query.text,
                     cursor: $cursor,
                     isFocused: $fieldFocused,
-                    placeholder: "/ for text search   ·   from .users as u where u.active count",
+                    placeholder: "/ for text search   ·   from .users[] as u where u.active aggregate { n: count() }",
                     font: NSFont.monospacedSystemFont(
                         ofSize: NSFont.systemFontSize,
                         weight: .regular

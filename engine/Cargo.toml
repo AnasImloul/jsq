@@ -1,7 +1,10 @@
 [package]
 name = "engine"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+description = "BigJSON: a single-pass engine and SQL-shaped query language (jsq) for querying very large JSON files."
+license = "MIT"
+repository = "https://github.com/AnasImloul/BigJSON"
 publish = false
 
 [lib]

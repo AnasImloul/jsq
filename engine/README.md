@@ -38,6 +38,6 @@ include/engine.h         Hand-written C header for FFI consumers.
 For a one-shot CLI query, building the record table is more work than a pure streaming parser would do — strictly speaking. We do it anyway because:
 
 1. The parser is fast enough that the record build still beats streaming-jq's per-token allocations by 5–6× on real queries.
-2. Selective queries skip past most of the table during evaluation — `.dimensions[].field` never re-walks `.series`.
+2. Selective queries skip past most of the table during evaluation — `.books[].field` never re-walks `.loans`.
 3. Joins literally need the table (the `Lookup` op walks a hashmap built over candidate records).
 4. The same code serves the interactive macOS app, where the parse cost is paid once and amortised over many queries in a session.

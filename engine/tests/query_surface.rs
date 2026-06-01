@@ -50,34 +50,34 @@ fn create_index(doc: &Document, source: &str, key: &str) {
     doc.indexes.lock().unwrap().insert(canon_src, canon_key, idx);
 }
 
-/// Cube fixture: a handful of series rows joined to a dimensions table.
-/// Used by most join / aggregate / partition tests.
-fn cube_doc(test_name: &str) -> Document {
+/// Library fixture: a handful of loan rows joined to a books table.
+/// Used by most join / aggregate / grouped-metric tests.
+fn library_doc(test_name: &str) -> Document {
     let path = write_tmp(
-        &format!("engine_query_surface_cube_{}.json", test_name),
-        r#"{"data":{"kpis":{
-            "series":[
-                {"id":"s1","dims_id":"d1","granularity":"day","values":{"weight":{"total":100,"adjusted":90}}},
-                {"id":"s2","dims_id":"d2","granularity":"day","values":{"weight":{"total":200,"adjusted":195}}},
-                {"id":"s3","dims_id":"d3","granularity":"day","values":{"weight":{"total":50,"adjusted":40}}},
-                {"id":"s4","dims_id":"d1","granularity":"week","values":{"weight":{"total":700,"adjusted":680}}},
-                {"id":"s5","dims_id":"d4","granularity":"day","values":{"weight":{"total":11000,"adjusted":10800}}},
-                {"id":"s6","dims_id":"d5","granularity":"day","values":{"weight":{"total":15,"adjusted":15}}},
-                {"id":"s7","dims_id":"d6","granularity":"day","values":{"weight":{"total":1000,"adjusted":990}}},
-                {"id":"s8","dims_id":"d6","granularity":"week","values":{"weight":{"total":7000,"adjusted":6900}}}
+        &format!("engine_query_surface_library_{}.json", test_name),
+        r#"{"catalog":{
+            "loans":[
+                {"id":"l1","book_id":"b1","branch":"east","days":{"borrowed":100,"renewed":90}},
+                {"id":"l2","book_id":"b2","branch":"east","days":{"borrowed":200,"renewed":195}},
+                {"id":"l3","book_id":"b3","branch":"east","days":{"borrowed":50,"renewed":40}},
+                {"id":"l4","book_id":"b1","branch":"west","days":{"borrowed":700,"renewed":680}},
+                {"id":"l5","book_id":"b4","branch":"east","days":{"borrowed":11000,"renewed":10800}},
+                {"id":"l6","book_id":"b5","branch":"east","days":{"borrowed":15,"renewed":15}},
+                {"id":"l7","book_id":"b6","branch":"east","days":{"borrowed":1000,"renewed":990}},
+                {"id":"l8","book_id":"b6","branch":"west","days":{"borrowed":7000,"renewed":6900}}
             ],
-            "dimensions":[
-                {"id":"d1","pay_category":"*","flow":"*","client":"acme","warehouse_id":"wh_07","cargo_type":"*","work_type_id":"*","worker_type":"*","worker_role":"*","worker_level":"*","shift_schedule":"*","shift_template_id":"*"},
-                {"id":"d2","pay_category":"*","flow":"*","client":"acme","warehouse_id":"wh_01","cargo_type":"*","work_type_id":"*","worker_type":"*","worker_role":"*","worker_level":"*","shift_schedule":"*","shift_template_id":"*"},
-                {"id":"d3","pay_category":"reg","flow":"*","client":"internal_test","warehouse_id":"wh_qa","cargo_type":"frozen","work_type_id":"*","worker_type":"*","worker_role":"*","worker_level":"*","shift_schedule":"*","shift_template_id":"*"},
-                {"id":"d4","pay_category":"*","flow":"*","client":"globex","warehouse_id":"wh_12","cargo_type":"frozen","work_type_id":"*","worker_type":"*","worker_role":"*","worker_level":"*","shift_schedule":"*","shift_template_id":"*"},
-                {"id":"d5","pay_category":"*","flow":"*","client":"acme","warehouse_id":"wh_sandbox","cargo_type":"*","work_type_id":"*","worker_type":"*","worker_role":"*","worker_level":"*","shift_schedule":"*","shift_template_id":"*"},
-                {"id":"d6","pay_category":"*","flow":"*","client":"*","warehouse_id":"*","cargo_type":"*","work_type_id":"*","worker_type":"*","worker_role":"*","worker_level":"*","shift_schedule":"*","shift_template_id":"*"}
+            "books":[
+                {"id":"b1","author":"rowling","shelf":"A1","genre":"fiction","available":true,"featured":true,"reservable":false},
+                {"id":"b2","author":"rowling","shelf":"A2","genre":"fiction","available":true,"featured":false,"reservable":true},
+                {"id":"b3","author":"orwell","shelf":"Q1","genre":"mystery","available":false,"featured":true,"reservable":true},
+                {"id":"b4","author":"asimov","shelf":"Z9","genre":"mystery","available":true,"featured":false,"reservable":true},
+                {"id":"b5","author":"rowling","shelf":"X0","genre":"fiction","available":true,"featured":true,"reservable":false},
+                {"id":"b6","author":"clarke","shelf":"M3","genre":"fiction","available":true,"featured":true,"reservable":true}
             ]
-        }}}"#,
+        }}"#,
     );
     let doc = Document::open(&path, None).unwrap();
-    create_index(&doc, ".data.kpis.dimensions[]", ".id");
+    create_index(&doc, ".catalog.books[]", ".id");
     doc
 }
 
@@ -85,11 +85,11 @@ fn pattern_doc(test_name: &str) -> Document {
     let path = write_tmp(
         &format!("engine_query_surface_pattern_{}.json", test_name),
         r#"{"items":[
-            {"client":"acme_us",     "warehouse":"wh_eu_paris"},
-            {"client":"acme_eu",     "warehouse":"wh_eu_berlin"},
-            {"client":"acme",        "warehouse":"wh_us_la"},
-            {"client":"globex_main", "warehouse":"wh_us_chicago"},
-            {"client":"initech",     "warehouse":"wh_apac_tokyo"}
+            {"client":"acme_us",     "location":"loc_eu_paris"},
+            {"client":"acme_eu",     "location":"loc_eu_berlin"},
+            {"client":"acme",        "location":"loc_us_la"},
+            {"client":"globex_main", "location":"loc_us_chicago"},
+            {"client":"initech",     "location":"loc_apac_tokyo"}
         ]}"#,
     );
     Document::open(&path, None).unwrap()
@@ -101,77 +101,75 @@ fn pattern_doc(test_name: &str) -> Document {
 
 #[test]
 fn q1_full_rollup_with_field_set() {
-    let doc = cube_doc("q1");
+    let doc = library_doc("q1");
     let q = r#"
-        from .data.kpis.series[] as s
-        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-        where dim.{
-            pay_category, flow, client, warehouse_id, cargo_type,
-            work_type_id, worker_type, worker_role, worker_level,
-            shift_schedule, shift_template_id,
-        } == "*"
-        aggregate { weight: sum(s.values.weight.total) } by s.granularity
+        from .catalog.loans[] as s
+        join .catalog.books[] as b on b.id == s.book_id
+        where b.{
+            available, featured, reservable,
+        } == true
+        aggregate { total: sum(s.days.borrowed) } by s.branch
     "#;
-    // Only d6 has every rollup dim set to "*". Its series s7 (day,
-    // 1000) and s8 (week, 7000) survive.
+    // Only b6 has every flag set to true. Its loans l7 (east, 1000)
+    // and l8 (west, 7000) survive.
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 2, "{:?}", out);
-    let day = out.iter().find(|r| r.starts_with("day → ")).unwrap();
-    assert!(day.contains("\"weight\": 1000"), "{}", day);
-    let week = out.iter().find(|r| r.starts_with("week → ")).unwrap();
-    assert!(week.contains("\"weight\": 7000"), "{}", week);
+    let east = out.iter().find(|r| r.starts_with("east → ")).unwrap();
+    assert!(east.contains("\"total\": 1000"), "{}", east);
+    let west = out.iter().find(|r| r.starts_with("west → ")).unwrap();
+    assert!(west.contains("\"total\": 7000"), "{}", west);
 }
 
 #[test]
 fn q2_single_slice_with_and_predicate() {
-    let doc = cube_doc("q2");
+    let doc = library_doc("q2");
     let q = r#"
-        from .data.kpis.series[] as s
-        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-        where dim.warehouse_id == "wh_07" and dim.client == "acme"
-        aggregate { weight: sum(s.values.weight.total) } by s.granularity
+        from .catalog.loans[] as s
+        join .catalog.books[] as b on b.id == s.book_id
+        where b.shelf == "A1" and b.author == "rowling"
+        aggregate { total: sum(s.days.borrowed) } by s.branch
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 2, "{:?}", out);
-    let day = out.iter().find(|r| r.starts_with("day → ")).unwrap();
-    assert!(day.contains("\"weight\": 100"), "{}", day);
-    let week = out.iter().find(|r| r.starts_with("week → ")).unwrap();
-    assert!(week.contains("\"weight\": 700"), "{}", week);
+    let east = out.iter().find(|r| r.starts_with("east → ")).unwrap();
+    assert!(east.contains("\"total\": 100"), "{}", east);
+    let west = out.iter().find(|r| r.starts_with("west → ")).unwrap();
+    assert!(west.contains("\"total\": 700"), "{}", west);
 }
 
 #[test]
 fn q3_in_membership() {
-    let doc = cube_doc("q3");
+    let doc = library_doc("q3");
     let q = r#"
-        from .data.kpis.series[] as s
-        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-        where dim.warehouse_id in ["wh_01", "wh_07", "wh_12"]
-          and dim.cargo_type == "frozen"
-        aggregate { weight: sum(s.values.weight.total) } by s.granularity
+        from .catalog.loans[] as s
+        join .catalog.books[] as b on b.id == s.book_id
+        where b.shelf in ["A2", "A1", "Z9"]
+          and b.genre == "mystery"
+        aggregate { total: sum(s.days.borrowed) } by s.branch
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 1, "{:?}", out);
-    assert!(out[0].starts_with("day → "), "{}", out[0]);
-    assert!(out[0].contains("\"weight\": 11000"), "{}", out[0]);
+    assert!(out[0].starts_with("east → "), "{}", out[0]);
+    assert!(out[0].contains("\"total\": 11000"), "{}", out[0]);
 }
 
 #[test]
 fn q4_ne_and_not_in_with_multi_key() {
-    let doc = cube_doc("q4");
+    let doc = library_doc("q4");
     let q = r#"
-        from .data.kpis.series[] as s
-        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-        where dim.client != "internal_test"
-          and dim.warehouse_id not in ["wh_sandbox", "wh_qa"]
-        aggregate { weight: sum(s.values.weight.total) } by s.granularity, dim.warehouse_id
+        from .catalog.loans[] as s
+        join .catalog.books[] as b on b.id == s.book_id
+        where b.author != "orwell"
+          and b.shelf not in ["X0", "Q1"]
+        aggregate { total: sum(s.days.borrowed) } by s.branch, b.shelf
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 6, "got {:?}", out);
     let joined: String = out.join("\n");
     for expected_n in ["100", "200", "700", "11000", "1000", "7000"] {
         assert!(
-            joined.contains(&format!("\"weight\": {}", expected_n)),
-            "expected bucket containing weight={} in {:?}",
+            joined.contains(&format!("\"total\": {}", expected_n)),
+            "expected bucket containing total={} in {:?}",
             expected_n,
             out
         );
@@ -180,26 +178,26 @@ fn q4_ne_and_not_in_with_multi_key() {
 
 #[test]
 fn q5_numeric_predicate_no_join() {
-    let doc = cube_doc("q5");
+    let doc = library_doc("q5");
     let q = r#"
-        from .data.kpis.series[] as s
-        where s.values.weight.total > 10000 and s.granularity == "day"
-        aggregate { weight: sum(s.values.weight.total) } by s.granularity
+        from .catalog.loans[] as s
+        where s.days.borrowed > 10000 and s.branch == "east"
+        aggregate { total: sum(s.days.borrowed) } by s.branch
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 1, "{:?}", out);
-    assert!(out[0].starts_with("day → "), "{}", out[0]);
-    assert!(out[0].contains("\"weight\": 11000"), "{}", out[0]);
+    assert!(out[0].starts_with("east → "), "{}", out[0]);
+    assert!(out[0].contains("\"total\": 11000"), "{}", out[0]);
 }
 
 #[test]
 fn join_canonical_form_hits_index() {
-    let doc = cube_doc("smoke");
+    let doc = library_doc("smoke");
     let q = r#"
-        from .data.kpis.series[] as s
-        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-        where dim.warehouse_id == "wh_07"
-        aggregate { n: count() } by s.granularity
+        from .catalog.loans[] as s
+        join .catalog.books[] as b on b.id == s.book_id
+        where b.author == "rowling"
+        aggregate { n: count() } by s.branch
     "#;
     let ast = surface::compile(q).expect("compile ok");
     let out = evaluator::run(&doc, &ast, 0, 5000);
@@ -217,28 +215,24 @@ fn join_canonical_form_hits_index() {
 
 #[test]
 fn fields_macro_spread_matches_inline() {
-    let doc = cube_doc("spread");
+    let doc = library_doc("spread");
     let inline = r#"
-        from .data.kpis.series[] as s
-        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-        where dim.{
-            pay_category, flow, client, warehouse_id, cargo_type,
-            work_type_id, worker_type, worker_role, worker_level,
-            shift_schedule, shift_template_id,
-        } == "*"
-        aggregate { weight: sum(s.values.weight.total) } by s.granularity
+        from .catalog.loans[] as s
+        join .catalog.books[] as b on b.id == s.book_id
+        where b.{
+            available, featured, reservable,
+        } == true
+        aggregate { total: sum(s.days.borrowed) } by s.branch
     "#;
     let spread = r#"
-        fields rollup_dims = {
-            pay_category, flow, client, warehouse_id, cargo_type,
-            work_type_id, worker_type, worker_role, worker_level,
-            shift_schedule, shift_template_id,
+        fields flags = {
+            available, featured, reservable,
         }
 
-        from .data.kpis.series[] as s
-        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-        where dim.{...rollup_dims} == "*"
-        aggregate { weight: sum(s.values.weight.total) } by s.granularity
+        from .catalog.loans[] as s
+        join .catalog.books[] as b on b.id == s.book_id
+        where b.{...flags} == true
+        aggregate { total: sum(s.days.borrowed) } by s.branch
     "#;
     let inline_out = run_surface(&doc, inline);
     let spread_out = run_surface(&doc, spread);
@@ -248,34 +242,24 @@ fn fields_macro_spread_matches_inline() {
 
 #[test]
 fn fields_macro_spread_with_override() {
-    let doc = cube_doc("override");
+    let doc = library_doc("override");
     let spread = r#"
-        fields rollup_dims = {
-            pay_category, flow, client, warehouse_id, cargo_type,
-            work_type_id, worker_type, worker_role, worker_level,
-            shift_schedule, shift_template_id,
+        fields flags = {
+            available, featured, reservable,
         }
 
-        from .data.kpis.series[] as s
-        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-        where dim.{...rollup_dims, cargo_type: "frozen"} == "*"
-        aggregate { weight: sum(s.values.weight.total) } by s.granularity
+        from .catalog.loans[] as s
+        join .catalog.books[] as b on b.id == s.book_id
+        where b.{...flags, reservable: false} == true
+        aggregate { total: sum(s.days.borrowed) } by s.branch
     "#;
     let inline = r#"
-        from .data.kpis.series[] as s
-        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-        where dim.pay_category == "*"
-          and dim.flow == "*"
-          and dim.client == "*"
-          and dim.warehouse_id == "*"
-          and dim.cargo_type == "frozen"
-          and dim.work_type_id == "*"
-          and dim.worker_type == "*"
-          and dim.worker_role == "*"
-          and dim.worker_level == "*"
-          and dim.shift_schedule == "*"
-          and dim.shift_template_id == "*"
-        aggregate { weight: sum(s.values.weight.total) } by s.granularity
+        from .catalog.loans[] as s
+        join .catalog.books[] as b on b.id == s.book_id
+        where b.available == true
+          and b.featured == true
+          and b.reservable == false
+        aggregate { total: sum(s.days.borrowed) } by s.branch
     "#;
     assert_eq!(run_surface(&doc, spread), run_surface(&doc, inline));
 }
@@ -286,22 +270,22 @@ fn fields_macro_spread_with_override() {
 
 #[test]
 fn select_projection_emits_synthetic_objects() {
-    let doc = cube_doc("select");
+    let doc = library_doc("select");
     let q = r#"
-        from .data.kpis.series[] as s
-        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-        where dim.warehouse_id in ["wh_01", "wh_07"]
+        from .catalog.loans[] as s
+        join .catalog.books[] as b on b.id == s.book_id
+        where b.shelf in ["A1", "A2"]
         select {
-            warehouse: dim.warehouse_id,
-            day:       s.granularity,
-            weight:    s.values.weight.total,
-            client:    dim.client,
+            shelf:  b.shelf,
+            branch: s.branch,
+            total:  s.days.borrowed,
+            author: b.author,
         }
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 3, "got rows: {:?}", out);
     for row in &out {
-        for field in ["warehouse", "day", "weight", "client"] {
+        for field in ["shelf", "branch", "total", "author"] {
             assert!(
                 row.contains(&format!("\"{}\":", field)),
                 "row missing field {}: {}",
@@ -310,26 +294,26 @@ fn select_projection_emits_synthetic_objects() {
             );
         }
     }
-    let s1 = out.iter().find(|r| r.contains("\"weight\": 100")).unwrap();
-    assert!(s1.contains("\"warehouse\": \"wh_07\""));
-    assert!(s1.contains("\"client\": \"acme\""));
+    let s1 = out.iter().find(|r| r.contains("\"total\": 100")).unwrap();
+    assert!(s1.contains("\"shelf\": \"A1\""));
+    assert!(s1.contains("\"author\": \"rowling\""));
 }
 
 #[test]
 fn select_with_missing_join_emits_null() {
-    let doc = cube_doc("select_null");
+    let doc = library_doc("select_null");
     let q = r#"
-        from .data.kpis.series[] as s
-        left join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
+        from .catalog.loans[] as s
+        left join .catalog.books[] as b on b.id == s.book_id
         select {
-            day:       s.granularity,
-            warehouse: dim.warehouse_id,
+            branch: s.branch,
+            shelf:  b.shelf,
         }
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 8);
     for row in &out {
-        assert!(row.contains("\"warehouse\":"), "row: {}", row);
+        assert!(row.contains("\"shelf\":"), "row: {}", row);
     }
 }
 
@@ -349,14 +333,14 @@ fn pattern_operators_starts_ends_contains_matches() {
 
     let ends = run_surface(
         &doc,
-        r#"from .items[] as i where i.warehouse ends_with "berlin" select { w: i.warehouse }"#,
+        r#"from .items[] as i where i.location ends_with "berlin" select { w: i.location }"#,
     );
     assert_eq!(ends.len(), 1);
-    assert!(ends[0].contains("\"w\": \"wh_eu_berlin\""));
+    assert!(ends[0].contains("\"w\": \"loc_eu_berlin\""));
 
     let contains = run_surface(
         &doc,
-        r#"from .items[] as i where i.warehouse contains "_us_" select { w: i.warehouse }"#,
+        r#"from .items[] as i where i.location contains "_us_" select { w: i.location }"#,
     );
     assert_eq!(contains.len(), 2);
 
@@ -368,7 +352,7 @@ fn pattern_operators_starts_ends_contains_matches() {
 
     let eu = run_surface(
         &doc,
-        r#"from .items[] as i where i.warehouse matches "wh_eu_*" select { w: i.warehouse }"#,
+        r#"from .items[] as i where i.location matches "loc_eu_*" select { w: i.location }"#,
     );
     assert_eq!(eu.len(), 2);
 
@@ -385,51 +369,51 @@ fn pattern_operators_starts_ends_contains_matches() {
 
 #[test]
 fn order_by_desc_with_limit() {
-    let doc = cube_doc("order_desc");
+    let doc = library_doc("order_desc");
     let q = r#"
-        from .data.kpis.series[] as s
+        from .catalog.loans[] as s
         select {
-            warehouse: s.dims_id,
-            weight:    s.values.weight.total,
+            book:  s.book_id,
+            total: s.days.borrowed,
         }
-        order by .weight desc
+        order by .total desc
         limit 3
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 3);
-    let weights: Vec<_> = out
+    let totals: Vec<_> = out
         .iter()
-        .map(|r| extract_int(r, "weight"))
+        .map(|r| extract_int(r, "total"))
         .collect();
-    assert_eq!(weights, vec!["11000", "7000", "1000"]);
+    assert_eq!(totals, vec!["11000", "7000", "1000"]);
 }
 
 #[test]
 fn order_by_default_direction_is_ascending() {
-    let doc = cube_doc("order_asc");
+    let doc = library_doc("order_asc");
     let q = r#"
-        from .data.kpis.series[] as s
-        select { weight: s.values.weight.total }
-        order by .weight
+        from .catalog.loans[] as s
+        select { total: s.days.borrowed }
+        order by .total
         limit 3
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 3);
-    let first_weights: Vec<_> = out
+    let first_totals: Vec<_> = out
         .iter()
-        .map(|r| extract_int(r, "weight"))
+        .map(|r| extract_int(r, "total"))
         .collect();
-    assert_eq!(first_weights, vec!["15", "50", "100"]);
+    assert_eq!(first_totals, vec!["15", "50", "100"]);
 }
 
 #[test]
 fn order_by_multiple_keys_with_tiebreak() {
-    let doc = cube_doc("order_multi");
+    let doc = library_doc("order_multi");
     let q = r#"
-        from .data.kpis.series[] as s
+        from .catalog.loans[] as s
         select {
-            g: s.granularity,
-            w: s.values.weight.total,
+            g: s.branch,
+            w: s.days.borrowed,
         }
         order by .g asc, .w desc
     "#;
@@ -441,7 +425,7 @@ fn order_by_multiple_keys_with_tiebreak() {
         .collect();
     assert_eq!(
         g_seq,
-        vec!["day", "day", "day", "day", "day", "day", "week", "week"]
+        vec!["east", "east", "east", "east", "east", "east", "west", "west"]
     );
     let w_seq: Vec<_> = out
         .iter()
@@ -479,69 +463,69 @@ fn extract_string(row: &str, field: &str) -> String {
 
 #[test]
 fn aggregate_block_multiple_reducers_by_key() {
-    let doc = cube_doc("agg_block");
+    let doc = library_doc("agg_block");
     let q = r#"
-        from .data.kpis.series[] as s
+        from .catalog.loans[] as s
         aggregate {
-            total_weight:   sum(s.values.weight.total),
-            shipment_count: count(),
-            avg_weight:     avg(s.values.weight.total),
-            peak:           max(s.values.weight.total),
-        } by s.granularity
+            total_days:   sum(s.days.borrowed),
+            loan_count:   count(),
+            avg_days:     avg(s.days.borrowed),
+            peak:         max(s.days.borrowed),
+        } by s.branch
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 2, "{:?}", out);
 
-    let day = out.iter().find(|r| r.starts_with("day → ")).unwrap();
-    assert!(day.contains("\"total_weight\": 12365"), "{}", day);
-    assert!(day.contains("\"shipment_count\": 6"), "{}", day);
-    assert!(day.contains("\"peak\": 11000"), "{}", day);
-    assert!(day.contains("\"avg_weight\": 2060."), "{}", day);
+    let east = out.iter().find(|r| r.starts_with("east → ")).unwrap();
+    assert!(east.contains("\"total_days\": 12365"), "{}", east);
+    assert!(east.contains("\"loan_count\": 6"), "{}", east);
+    assert!(east.contains("\"peak\": 11000"), "{}", east);
+    assert!(east.contains("\"avg_days\": 2060."), "{}", east);
 
-    let week = out.iter().find(|r| r.starts_with("week → ")).unwrap();
-    assert!(week.contains("\"total_weight\": 7700"), "{}", week);
-    assert!(week.contains("\"shipment_count\": 2"), "{}", week);
-    assert!(week.contains("\"peak\": 7000"), "{}", week);
-    assert!(week.contains("\"avg_weight\": 3850"), "{}", week);
+    let west = out.iter().find(|r| r.starts_with("west → ")).unwrap();
+    assert!(west.contains("\"total_days\": 7700"), "{}", west);
+    assert!(west.contains("\"loan_count\": 2"), "{}", west);
+    assert!(west.contains("\"peak\": 7000"), "{}", west);
+    assert!(west.contains("\"avg_days\": 3850"), "{}", west);
 }
 
 #[test]
 fn aggregate_block_conditional_reducer_via_where() {
-    let doc = cube_doc("agg_cond");
+    let doc = library_doc("agg_cond");
     let q = r#"
-        from .data.kpis.series[] as s
-        join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
+        from .catalog.loans[] as s
+        join .catalog.books[] as b on b.id == s.book_id
         aggregate {
-            frozen_weight: sum(s.values.weight.total) where dim.cargo_type == "frozen",
-            total_weight:  sum(s.values.weight.total),
-        } by s.granularity
+            mystery_days: sum(s.days.borrowed) where b.genre == "mystery",
+            total_days:   sum(s.days.borrowed),
+        } by s.branch
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 2);
 
-    let day = out.iter().find(|r| r.starts_with("day → ")).unwrap();
-    assert!(day.contains("\"frozen_weight\": 11050"), "{}", day);
-    assert!(day.contains("\"total_weight\": 12365"), "{}", day);
+    let east = out.iter().find(|r| r.starts_with("east → ")).unwrap();
+    assert!(east.contains("\"mystery_days\": 11050"), "{}", east);
+    assert!(east.contains("\"total_days\": 12365"), "{}", east);
 
-    let week = out.iter().find(|r| r.starts_with("week → ")).unwrap();
-    assert!(week.contains("\"frozen_weight\": null"), "{}", week);
-    assert!(week.contains("\"total_weight\": 7700"), "{}", week);
+    let west = out.iter().find(|r| r.starts_with("west → ")).unwrap();
+    assert!(west.contains("\"mystery_days\": null"), "{}", west);
+    assert!(west.contains("\"total_days\": 7700"), "{}", west);
 }
 
 #[test]
 fn aggregate_block_then_order_then_limit() {
-    let doc = cube_doc("agg_top1");
+    let doc = library_doc("agg_top1");
     let q = r#"
-        from .data.kpis.series[] as s
-        aggregate { weight: sum(s.values.weight.total) } by s.granularity
-        order by .weight desc
+        from .catalog.loans[] as s
+        aggregate { total: sum(s.days.borrowed) } by s.branch
+        order by .total desc
         limit 1
     "#;
     let out = run_surface(&doc, q);
     assert_eq!(out.len(), 1);
     let row = &out[0];
-    assert!(row.starts_with("day → "), "{}", row);
-    assert!(row.contains("\"weight\": 12365"), "{}", row);
+    assert!(row.starts_with("east → "), "{}", row);
+    assert!(row.contains("\"total\": 12365"), "{}", row);
 }
 
 #[test]
@@ -604,15 +588,15 @@ fn aggregate_block_rollup_emits_subtotals_and_grand_total() {
 // grouped aggregate over buckets (was the removed `partition`/`each` form)
 // ============================================================================
 
-fn partition_cube_doc(test_name: &str) -> Document {
+fn genre_doc(test_name: &str) -> Document {
     let path = write_tmp(
-        &format!("engine_query_surface_partition_{}.json", test_name),
+        &format!("engine_query_surface_genre_{}.json", test_name),
         r#"{"rows":[
-            {"cargo_type":"BUP","forecast":120,"baseline":100},
-            {"cargo_type":"BUP","forecast":80,"baseline":100},
-            {"cargo_type":"LOO","forecast":50,"baseline":40},
-            {"cargo_type":"LOO","forecast":60,"baseline":40},
-            {"cargo_type":"GEN","forecast":200,"baseline":250}
+            {"genre":"fiction","actual":120,"target":100},
+            {"genre":"fiction","actual":80,"target":100},
+            {"genre":"history","actual":50,"target":40},
+            {"genre":"history","actual":60,"target":40},
+            {"genre":"science","actual":200,"target":250}
         ]}"#,
     );
     Document::open(&path, None).unwrap()
@@ -623,28 +607,28 @@ fn partition_cube_doc(test_name: &str) -> Document {
 // grouped `aggregate { ... } by KEY`.
 #[test]
 fn grouped_aggregate_derives_per_bucket_metrics() {
-    let doc = partition_cube_doc("basic");
+    let doc = genre_doc("basic");
     let q = r#"
         from .rows[] as r
-        let fw = sum(r.forecast),
-            bw = sum(r.baseline)
+        let a = sum(r.actual),
+            t = sum(r.target)
         aggregate {
-            pct:    (fw - bw) / bw * 100,
-            delta:  fw - bw
-        } by r.cargo_type
+            pct:    (a - t) / t * 100,
+            delta:  a - t
+        } by r.genre
     "#;
     let out = run_surface(&doc, q);
-    // One row per cargo_type bucket.
-    // BUP: fw=200, bw=200 → pct=0, delta=0
-    // LOO: fw=110, bw=80  → pct=37.5, delta=30
-    // GEN: fw=200, bw=250 → pct=-20, delta=-50
+    // One row per genre bucket.
+    // fiction: a=200, t=200 → pct=0, delta=0
+    // history: a=110, t=80  → pct=37.5, delta=30
+    // science: a=200, t=250 → pct=-20, delta=-50
     assert_eq!(out.len(), 3, "{:?}", out);
     let joined = out.join("\n");
-    assert!(joined.contains("BUP"), "missing BUP: {:?}", out);
-    assert!(joined.contains("LOO"), "missing LOO: {:?}", out);
-    assert!(joined.contains("GEN"), "missing GEN: {:?}", out);
-    assert!(joined.contains("37.5"), "missing loo pct (37.5): {:?}", out);
-    assert!(joined.contains("-50"), "missing gen delta (-50): {:?}", out);
+    assert!(joined.contains("fiction"), "missing fiction: {:?}", out);
+    assert!(joined.contains("history"), "missing history: {:?}", out);
+    assert!(joined.contains("science"), "missing science: {:?}", out);
+    assert!(joined.contains("37.5"), "missing history pct (37.5): {:?}", out);
+    assert!(joined.contains("-50"), "missing science delta (-50): {:?}", out);
 }
 
 // ============================================================================
@@ -700,20 +684,20 @@ fn collect_by_collects_members_per_bucket() {
 
 #[test]
 fn aggregate_block_no_by_emits_one_named_row() {
-    let doc = cube_doc("agg_no_by");
+    let doc = library_doc("agg_no_by");
     let out = run_surface(
         &doc,
-        "from .data.kpis.series[] as s aggregate { total: sum(s.values.weight.total) }",
+        "from .catalog.loans[] as s aggregate { total: sum(s.days.borrowed) }",
     );
     assert_eq!(out, vec!["total → 20065"]);
 }
 
 #[test]
 fn aggregate_count_without_by_or_arg() {
-    let doc = cube_doc("count_no_by");
+    let doc = library_doc("count_no_by");
     let out = run_surface(
         &doc,
-        "from .data.kpis.series[] as s aggregate { n: count() }",
+        "from .catalog.loans[] as s aggregate { n: count() }",
     );
     assert_eq!(out, vec!["n → 8"]);
 }
@@ -737,13 +721,13 @@ fn bare_reducer_clause_is_rejected() {
 
 #[test]
 fn aggregate_block_without_by_emits_one_row_per_reduction() {
-    let doc = cube_doc("agg_block_no_by");
+    let doc = library_doc("agg_block_no_by");
     let q = r#"
-        from .data.kpis.series[] as s
+        from .catalog.loans[] as s
         aggregate {
-            total: sum(s.values.weight.total),
+            total: sum(s.days.borrowed),
             rows:  count(),
-            peak:  max(s.values.weight.total),
+            peak:  max(s.days.borrowed),
         }
     "#;
     let out = run_surface(&doc, q);
@@ -759,14 +743,14 @@ fn aggregate_block_without_by_emits_one_row_per_reduction() {
 
 #[test]
 fn aggregate_empty_distinguishes_no_values_from_zero() {
-    let doc = cube_doc("agg_null");
+    let doc = library_doc("agg_null");
     let q = r#"
-        from .data.kpis.series[] as s
-        where s.granularity == "monthly_unobtainable"
+        from .catalog.loans[] as s
+        where s.branch == "unobtainable_branch"
         aggregate {
-            total:        sum(s.values.weight.total),
-            with_default: sum(s.values.weight.total) ?? 0,
-            with_label:   sum(s.values.weight.total) ?? null,
+            total:        sum(s.days.borrowed),
+            with_default: sum(s.days.borrowed) ?? 0,
+            with_label:   sum(s.days.borrowed) ?? null,
         }
     "#;
     let out = run_surface(&doc, q);
@@ -854,15 +838,15 @@ fn iteration_in_middle_of_path() {
     let path = write_tmp(
         "engine_query_mid_iter.json",
         r#"{"data":{
-            "kpi_a": {"series":[{"g":"day"},{"g":"day"},{"g":"week"}]},
-            "kpi_b": {"series":[{"g":"day"}]},
-            "kpi_c": {"unrelated":1}
+            "group_a": {"items":[{"g":"day"},{"g":"day"},{"g":"week"}]},
+            "group_b": {"items":[{"g":"day"}]},
+            "group_c": {"unrelated":1}
         }}"#,
     );
     let doc = Document::open(&path, None).unwrap();
     let out = run_surface(
         &doc,
-        r#"from .data[].series[] as s where s.g == "day" aggregate { n: count() } by s.g"#,
+        r#"from .data[].items[] as s where s.g == "day" aggregate { n: count() } by s.g"#,
     );
     assert_eq!(out.len(), 1);
     assert!(out[0].contains("\"n\": 3"), "{}", out[0]);
@@ -1075,22 +1059,22 @@ fn iteration_with_field_set_predicate() {
     let path = write_tmp(
         "engine_query_field_set_iter.json",
         r#"{"regions":{
-            "us":   {"warehouses":[
+            "us":   {"sites":[
                 {"status":"ok",   "region_id":"us"},
                 {"status":"warn", "region_id":"us"}
             ]},
-            "eu":   {"warehouses":[
+            "eu":   {"sites":[
                 {"status":"ok",   "region_id":"eu"},
                 {"status":null,   "region_id":"eu"}
             ]},
-            "apac": {"warehouses":[
+            "apac": {"sites":[
                 {"status":"ok"}
             ]}
         }}"#,
     );
     let doc = Document::open(&path, None).unwrap();
     let q = r#"
-        from .regions[].warehouses[] as w
+        from .regions[].sites[] as w
         where w.{status, region_id} != null
         aggregate { n: count() } by w.region_id
     "#;
@@ -1265,20 +1249,20 @@ fn reducer_outside_aggregate_block_errors() {
 
 #[test]
 fn alias_let_substitutes_into_aggregate_item() {
-    let doc = partition_cube_doc("alias_only");
+    let doc = genre_doc("alias_only");
     let sugar = r#"
         from .rows[] as r
-        let fw = sum(r.forecast)
+        let a = sum(r.actual)
         aggregate {
-            total: fw,
-            doubled: fw * 2
+            total: a,
+            doubled: a * 2
         }
     "#;
     let direct = r#"
         from .rows[] as r
         aggregate {
-            total: sum(r.forecast),
-            doubled: sum(r.forecast) * 2
+            total: sum(r.actual),
+            doubled: sum(r.actual) * 2
         }
     "#;
     assert_eq!(run_surface(&doc, sugar), run_surface(&doc, direct));
@@ -1286,16 +1270,16 @@ fn alias_let_substitutes_into_aggregate_item() {
 
 #[test]
 fn alias_let_forward_chain() {
-    let doc = partition_cube_doc("alias_chain");
+    let doc = genre_doc("alias_chain");
     let sugar = r#"
         from .rows[] as r
-        let a = sum(r.forecast),
+        let a = sum(r.actual),
             b = a + 1
         aggregate { result: b }
     "#;
     let direct = r#"
         from .rows[] as r
-        aggregate { result: sum(r.forecast) + 1 }
+        aggregate { result: sum(r.actual) + 1 }
     "#;
     assert_eq!(run_surface(&doc, sugar), run_surface(&doc, direct));
 }
@@ -1491,14 +1475,14 @@ select {
 #[test]
 fn formatter_is_idempotent_on_canonical_input() {
     let canonical = "\
-from .data.kpis.series[] as s
-join .data.kpis.dimensions[] as dim
-  on dim.id == s.dims_id
-where dim.warehouse_id == \"wh_07\"
-and dim.client == \"acme\"
+from .catalog.loans[] as s
+join .catalog.books[] as b
+  on b.id == s.book_id
+where b.shelf == \"A1\"
+and b.author == \"rowling\"
 aggregate {
-  weight: sum(s.values.weight.total)
-} by s.granularity";
+  total: sum(s.days.borrowed)
+} by s.branch";
     let once = surface::format(canonical).expect("format ok");
     assert_eq!(once, canonical);
     let twice = surface::format(&once).expect("format ok");
@@ -1507,17 +1491,17 @@ aggregate {
 
 #[test]
 fn formatter_normalises_messy_input() {
-    let messy = "from .data.kpis.series[] as s join .data.kpis.dimensions[] as dim on dim.id==s.dims_id where dim.warehouse_id==\"wh_07\" and dim.client==\"acme\" aggregate{weight:sum(s.values.weight.total)}by s.granularity";
+    let messy = "from .catalog.loans[] as s join .catalog.books[] as b on b.id==s.book_id where b.shelf==\"A1\" and b.author==\"rowling\" aggregate{total:sum(s.days.borrowed)}by s.branch";
     let formatted = surface::format(messy).expect("format ok");
     let expected = "\
-from .data.kpis.series[] as s
-join .data.kpis.dimensions[] as dim
-  on dim.id == s.dims_id
-where dim.warehouse_id == \"wh_07\"
-and dim.client == \"acme\"
+from .catalog.loans[] as s
+join .catalog.books[] as b
+  on b.id == s.book_id
+where b.shelf == \"A1\"
+and b.author == \"rowling\"
 aggregate {
-  weight: sum(s.values.weight.total)
-} by s.granularity";
+  total: sum(s.days.borrowed)
+} by s.branch";
     assert_eq!(formatted, expected);
 }
 
@@ -1573,29 +1557,29 @@ fn hash_is_not_a_comment() {
 
 #[test]
 fn query_compile_runs_surface_end_to_end() {
-    let doc = cube_doc("compile");
+    let doc = library_doc("compile");
     let ast = query::compile(
-        r#"from .data.kpis.series[] as s where s.granularity == "week" aggregate { weight: sum(s.values.weight.total) } by s.granularity"#,
+        r#"from .catalog.loans[] as s where s.branch == "west" aggregate { total: sum(s.days.borrowed) } by s.branch"#,
     )
     .expect("compile ok");
     let out = evaluator::run(&doc, &ast, 0, 5000);
     assert!(out.error.is_none());
     let formatted = format_results(&doc, out.results);
     assert_eq!(formatted.len(), 1);
-    assert!(formatted[0].starts_with("week → "), "{}", formatted[0]);
-    assert!(formatted[0].contains("\"weight\": 7700"), "{}", formatted[0]);
+    assert!(formatted[0].starts_with("west → "), "{}", formatted[0]);
+    assert!(formatted[0].contains("\"total\": 7700"), "{}", formatted[0]);
 }
 
 #[test]
 fn scanned_rows_counts_source_emissions() {
-    let doc = cube_doc("scanned");
-    let ast = query::compile("from .data.kpis.series[] as s aggregate { n: count() }")
+    let doc = library_doc("scanned");
+    let ast = query::compile("from .catalog.loans[] as s aggregate { n: count() }")
         .expect("compile ok");
     let out = evaluator::run(&doc, &ast, 0, 5000);
     assert_eq!(out.scanned_rows, 8);
 
     let ast = query::compile(
-        r#"from .data.kpis.series[] as s where s.granularity == "week" aggregate { n: count() }"#,
+        r#"from .catalog.loans[] as s where s.branch == "west" aggregate { n: count() }"#,
     )
     .expect("compile ok");
     let out = evaluator::run(&doc, &ast, 0, 5000);
@@ -1605,10 +1589,10 @@ fn scanned_rows_counts_source_emissions() {
 
 #[test]
 fn join_runs_one_lookup_per_row() {
-    let doc = cube_doc("lookup_calls");
+    let doc = library_doc("lookup_calls");
 
     let ast = query::compile(
-        "from .data.kpis.series[] as s aggregate { n: count() } by s.granularity",
+        "from .catalog.loans[] as s aggregate { n: count() } by s.branch",
     )
     .expect("compile ok");
     let out = evaluator::run(&doc, &ast, 0, 5000);
@@ -1616,9 +1600,9 @@ fn join_runs_one_lookup_per_row() {
 
     let ast = query::compile(
         r#"
-            from .data.kpis.series[] as s
-            join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-            select { wh: dim.warehouse_id }
+            from .catalog.loans[] as s
+            join .catalog.books[] as b on b.id == s.book_id
+            select { sh: b.shelf }
         "#,
     )
     .expect("compile ok");
@@ -1627,10 +1611,10 @@ fn join_runs_one_lookup_per_row() {
 
     let ast = query::compile(
         r#"
-            from .data.kpis.series[] as s
-            join .data.kpis.dimensions[] as dim on dim.id == s.dims_id
-            where dim.cargo_type == "*" and dim.client == "*"
-            aggregate { n: count() } by s.granularity
+            from .catalog.loans[] as s
+            join .catalog.books[] as b on b.id == s.book_id
+            where b.available == true and b.featured == true
+            aggregate { n: count() } by s.branch
         "#,
     )
     .expect("compile ok");

@@ -866,7 +866,7 @@ impl Parser {
                     self.parse_call()
                 }
                 _ => {
-                    // Bare-name path: `s`, `s.warehouse_id`, etc.
+                    // Bare-name path: `s`, `s.book_id`, etc.
                     let path = self.parse_path(/* allow_field_set */ true)?;
                     Ok(Expr::Path(path))
                 }
