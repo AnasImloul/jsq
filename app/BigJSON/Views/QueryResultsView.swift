@@ -320,11 +320,11 @@ struct QueryResultsView: View {
             switch parsed {
             case .scalar(let t, let v):
                 return RowEntry(mode: mode, type: t, payload: .scalar(v), nodeID: nil, path: path)
-            case .container(let kind, let children):
+            case .container(let kind, let entries):
                 return RowEntry(
                     mode: mode,
                     type: kind == .object ? .object : .array,
-                    payload: .container(kind: kind, children: children),
+                    payload: .container(kind: kind, children: .eager(entries)),
                     nodeID: nil,
                     path: path
                 )
@@ -585,17 +585,12 @@ struct TabularSnapshot {
         if r.nodeID == nil,
            let text = r.fullText,
            let parsed = ResultsJSON.parse(text),
-           case .container(.object, let children) = parsed {
-            switch children {
-            case .eager(let entries):
-                var out: [String: TabularCell] = [:]
-                for (k, v) in entries {
-                    out[k] = cellFromNode(v)
-                }
-                return out
-            case .lazy:
-                return [:]
+           case .container(.object, let entries) = parsed {
+            var out: [String: TabularCell] = [:]
+            for (k, v) in entries {
+                out[k] = cellFromNode(v)
             }
+            return out
         }
         return [:]
     }
@@ -626,13 +621,8 @@ struct TabularSnapshot {
         switch node {
         case .scalar(let t, let v):
             return .scalar(type: t, text: v)
-        case .container(let kind, let children):
-            let count: Int
-            switch children {
-            case .eager(let entries): count = entries.count
-            case .lazy(let meta):     count = meta.totalChildren
-            }
-            return .container(kind: kind, count: count, nodeID: nil)
+        case .container(let kind, let entries):
+            return .container(kind: kind, count: entries.count, nodeID: nil)
         }
     }
 }
@@ -772,14 +762,20 @@ enum ContainerKind: Equatable {
     var closeBrace: String { self == .object ? "}" : "]" }
 }
 
-indirect enum ContainerChildren {
+enum ContainerChildren {
     case eager([(String, ResultsNode)])
     case lazy(LazyMeta)
 }
 
+// Self-recursive (children inlined rather than routed through
+// `ContainerChildren`). The mutual `ResultsNode` ⇄ `ContainerChildren`
+// reference tripped a "circular reference" type-check error under the
+// Swift compiler in CI; collapsing it to single self-recursion avoids
+// the cycle. `ResultsJSON` only ever builds eager containers, so no
+// lazy case is needed here.
 indirect enum ResultsNode {
     case scalar(JSONNodeType, String)
-    case container(ContainerKind, ContainerChildren)
+    case container(ContainerKind, [(String, ResultsNode)])
 }
 
 struct LazyMeta {
@@ -1069,11 +1065,11 @@ private struct ChildrenList: View {
         switch node {
         case .scalar(let t, let v):
             return RowEntry(mode: mode, type: t, payload: .scalar(v), nodeID: nil, path: path)
-        case .container(let kind, let children):
+        case .container(let kind, let entries):
             return RowEntry(
                 mode: mode,
                 type: kind.asNodeType,
-                payload: .container(kind: kind, children: children),
+                payload: .container(kind: kind, children: .eager(entries)),
                 nodeID: nil,
                 path: path
             )
@@ -1300,7 +1296,7 @@ enum ResultsJSON {
         guard c.match("{") else { return nil }
         var entries: [(String, ResultsNode)] = []
         c.skipWS()
-        if c.match("}") { return .container(.object, .eager(entries)) }
+        if c.match("}") { return .container(.object, entries) }
         while true {
             c.skipWS()
             guard let key = parseString(&c) else { return nil }
@@ -1310,7 +1306,7 @@ enum ResultsJSON {
             entries.append((key, value))
             c.skipWS()
             if c.match(",") { continue }
-            if c.match("}") { return .container(.object, .eager(entries)) }
+            if c.match("}") { return .container(.object, entries) }
             return nil
         }
     }
@@ -1319,7 +1315,7 @@ enum ResultsJSON {
         guard c.match("[") else { return nil }
         var entries: [(String, ResultsNode)] = []
         c.skipWS()
-        if c.match("]") { return .container(.array, .eager(entries)) }
+        if c.match("]") { return .container(.array, entries) }
         var idx = 0
         while true {
             guard let value = parseValue(&c) else { return nil }
@@ -1327,7 +1323,7 @@ enum ResultsJSON {
             idx += 1
             c.skipWS()
             if c.match(",") { continue }
-            if c.match("]") { return .container(.array, .eager(entries)) }
+            if c.match("]") { return .container(.array, entries) }
             return nil
         }
     }
