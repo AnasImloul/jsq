@@ -100,3 +100,86 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
           files: ${{ steps.dmg.outputs.path }}
+
+  cli:
+    name: Build jsq CLI (${{ matrix.goos }}/${{ matrix.goarch }})
+    # Runs after the .dmg job so the GitHub release already exists; each
+    # matrix leg then just uploads its tarball to it (no create race).
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            goos: darwin
+            goarch: arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            goos: darwin
+            goarch: amd64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve version label
+        id: version
+        run: |
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Drop the leading v for the tarball name (v1.0.0 -> 1.0.0),
+          # matching the GoReleaser-style naming used by the tap.
+          echo "value=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo deps
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+          key: ${{ matrix.target }}
+
+      - name: Install aarch64 cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build jsq
+        working-directory: engine
+        run: cargo build --release --locked --bin jsq --target ${{ matrix.target }}
+
+      - name: Package tarball
+        id: pkg
+        run: |
+          ver="${{ steps.version.outputs.value }}"
+          name="jsq_${ver}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          bin_dir="engine/target/${{ matrix.target }}/release"
+          mkdir -p dist
+          tar -C "$bin_dir" -czf "dist/${name}.tar.gz" jsq
+          echo "path=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload CLI tarball to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          fail_on_unmatched_files: true
+          files: ${{ steps.pkg.outputs.path }}
