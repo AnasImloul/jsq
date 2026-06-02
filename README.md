@@ -105,19 +105,22 @@ The parser, lowerer, and formatter are in `engine/src/query/surface/`, and
 
 ## Benchmarks
 
-`jsq` streams in a single memory-mapped pass; `jq` parses the whole document onto the
-heap. So jsq's memory stays flat as files grow while jq's tracks the file size — and the
-time gap widens with it. Same group-by-and-sum query, three file sizes:
+`jsq` streams in a single memory-mapped pass; `jq` and `jaq` (jq's Rust reimplementation)
+parse the whole document onto the heap. So jsq's memory stays flat as files grow while
+theirs tracks the file size — and the time gap widens with it. Same group-by-and-sum
+query, three file sizes (wall time / RAM):
 
-| File   | jsq time | jq time | speedup | jsq RAM | jq RAM | less memory |
-|--------|---------:|--------:|--------:|--------:|-------:|------------:|
-| 10 MB  |   0.26s  |   0.61s |  2.3×   | 30 MiB  | 169 MiB |   ~6×      |
-| 100 MB |   0.85s  |   5.33s |  6.2×   | 33 MiB  | 1.7 GB  |  ~50×      |
-| 1 GB   |   5.01s  |  50.74s | 10.1×   | 34 MiB  |  17 GB  | ~500×      |
+| File   | jsq | jq | jaq | jsq RAM | jq RAM | jaq RAM |
+|--------|----:|---:|----:|--------:|-------:|--------:|
+| 10 MB  |  0.25s |  0.47s |  0.24s | 30 MiB | 170 MiB | 153 MiB |
+| 100 MB |  0.64s |  4.53s |  2.14s | 33 MiB | 1.7 GB  | 1.5 GB  |
+| 1 GB   |  5.00s | 52.05s | 25.13s | 34 MiB |  17 GB  |  15 GB  |
 
 "RAM" is the real memory the process owns — the figure Activity Monitor shows. At 1 GB
-jsq answers in ~5s holding **34 MiB**, where jq takes ~51s and needs **17 GB**.
+jsq answers in ~5s holding **34 MiB**; jaq, despite being a fast Rust rewrite, still needs
+**~15 GB** because it parses everything. **The memory win is the streaming architecture,
+not the language** — jsq beats jaq on RAM by the same ~450× it beats jq.
 
 See **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** for the full methodology, all four query
-shapes, and both memory metrics (`jq` is faster on small files — the reference is honest
-about where each tool wins).
+shapes, and both memory metrics (jq/jaq are faster on small files — the reference is
+honest about where each tool wins).

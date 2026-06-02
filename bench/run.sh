@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Benchmark jsq against jq on a generated events file.
+# Benchmark jsq against jq and jaq on a generated events file.
 #
-#   bench/run.sh exec <jsq|jq> <FILE> <QFILE>   # run one query once (output -> stdout)
-#   bench/run.sh bench <FILE> <LABEL> [RUNS]     # full sweep, prints a markdown table
+#   bench/run.sh exec <jsq|jq|jaq> <FILE> <QFILE>   # run one query once (output -> stdout)
+#   bench/run.sh bench <FILE> <LABEL> [RUNS]         # full sweep, prints markdown tables
 #
-# `bench` measures median wall time (hyperfine) and peak resident memory
-# (/usr/bin/time -l, macOS) for each of the four queries, for both tools.
+# `bench` measures median wall time (hyperfine) and peak memory
+# (/usr/bin/time -l, macOS) for each of the four queries, for all three
+# tools. jq and jaq run the same .jq filter (jaq is a jq reimplementation
+# in Rust), so the pair isolates streaming-vs-full-parse from C-vs-Rust.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -18,7 +20,8 @@ exec)
     q="$(cat "$qfile")"
     case "$tool" in
         jsq) exec "$JSQ" "$file" "$q" ;;
-        jq)  exec jq "$q" "$file" ;;
+        jq)  exec jq  "$q" "$file" ;;
+        jaq) exec jaq "$q" "$file" ;;
         *) echo "unknown tool: $tool" >&2; exit 2 ;;
     esac
     ;;
@@ -44,24 +47,39 @@ bench)
         jq -r '.results[0].median' "$j"
         rm -f "$j"
     }
+    # jsq has its own query file; jq and jaq share the .jq filter.
+    qf() { # tool q -> query file path
+        case "$1" in jsq) echo "$QDIR/$2.jsq" ;; *) echo "$QDIR/$2.jq" ;; esac
+    }
+
     echo "### $label"
     echo
-    echo "| Query | jsq time | jq time | time speedup | jsq RAM | jq RAM | RAM ratio | jsq RSS | jq RSS |"
-    echo "|-------|---------:|--------:|-------------:|--------:|-------:|----------:|--------:|-------:|"
+    echo "**Median wall time (s)**"
+    echo
+    echo "| Query | jsq | jq | jaq |"
+    echo "|-------|----:|---:|----:|"
     for q in q1 q2 q3 q4; do
-        jsqf="$QDIR/$q.jsq"; jqf="$QDIR/$q.jq"
-        jt="$(median_s jsq "$jsqf")"; qt="$(median_s jq "$jqf")"
-        read -r jfp jrss <<<"$(peak_mem jsq "$jsqf")"
-        read -r qfp qrss <<<"$(peak_mem jq "$jqf")"
-        sp="$(awk -v a="$qt" -v b="$jt" 'BEGIN{printf "%.1fx", a/b}')"
-        mr="$(awk -v a="$qfp" -v b="$jfp" 'BEGIN{printf "%.0fx", a/b}')"
-        printf "| %s | %.3fs | %.3fs | %s | %s MiB | %s MiB | %s | %s MiB | %s MiB |\n" \
-            "$q" "$jt" "$qt" "$sp" "$jfp" "$qfp" "$mr" "$jrss" "$qrss"
+        jt="$(median_s jsq "$(qf jsq $q)")"
+        qt="$(median_s jq  "$(qf jq  $q)")"
+        at="$(median_s jaq "$(qf jaq $q)")"
+        printf "| %s | %.3f | %.3f | %.3f |\n" "$q" "$jt" "$qt" "$at"
+    done
+    echo
+    echo "**Peak memory — RAM (footprint) / RSS, MiB**"
+    echo
+    echo "| Query | jsq RAM | jq RAM | jaq RAM | jsq RSS | jq RSS | jaq RSS |"
+    echo "|-------|--------:|-------:|--------:|--------:|-------:|--------:|"
+    for q in q1 q2 q3 q4; do
+        read -r jfp jrss <<<"$(peak_mem jsq "$(qf jsq $q)")"
+        read -r qfp qrss <<<"$(peak_mem jq  "$(qf jq  $q)")"
+        read -r afp arss <<<"$(peak_mem jaq "$(qf jaq $q)")"
+        printf "| %s | %s | %s | %s | %s | %s | %s |\n" \
+            "$q" "$jfp" "$qfp" "$afp" "$jrss" "$qrss" "$arss"
     done
     echo
     ;;
 *)
-    echo "usage: run.sh exec <jsq|jq> <FILE> <QFILE> | run.sh bench <FILE> <LABEL> [RUNS]" >&2
+    echo "usage: run.sh exec <jsq|jq|jaq> <FILE> <QFILE> | run.sh bench <FILE> <LABEL> [RUNS]" >&2
     exit 2
     ;;
 esac
