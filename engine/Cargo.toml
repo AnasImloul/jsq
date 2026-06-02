@@ -1,6 +1,6 @@
 [package]
 name = "jsql"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "A single-pass engine and SQL-shaped query language (jsq) for querying very large JSON files."
 license = "MIT"

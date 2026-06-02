@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-02
+
 ### Added
 - `distinct by KEY[, KEY]...` — dedupe the stream on a key tuple (emitting the
   first whole row per distinct key), the equivalent of SQL `DISTINCT ON`. Bare
@@ -36,5 +38,6 @@ First public release.
 - Distribution: prebuilt CLI binaries for macOS and Linux (arm64 + x86_64) via a
   Homebrew tap, and a `.dmg` for the macOS app.
 
-[Unreleased]: https://github.com/AnasImloul/jsq/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/AnasImloul/jsq/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/AnasImloul/jsq/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/AnasImloul/jsq/releases/tag/v1.0.0
