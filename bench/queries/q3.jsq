@@ -1,1 +1,2 @@
-from .events[] as e aggregate { revenue: sum(e.amount) } by e.region
+from .events[] as e
+aggregate { revenue: sum(e.amount) } by e.region

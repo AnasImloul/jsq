@@ -1,0 +1,5 @@
+from .events[] as e
+where e.status == "paid"
+aggregate { revenue: sum(e.amount), n: count() } by e.region
+having .revenue > 400000
+order by .revenue desc

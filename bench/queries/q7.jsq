@@ -1,0 +1,4 @@
+from .events[] as e
+unnest e.items as it
+aggregate { qty: sum(it.qty) } by it.sku
+order by .sku

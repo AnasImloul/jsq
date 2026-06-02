@@ -58,7 +58,7 @@ bench)
     echo
     echo "| Query | jsq | jq | jaq |"
     echo "|-------|----:|---:|----:|"
-    for q in q1 q2 q3 q4; do
+    for q in q1 q2 q3 q4 q5 q6 q7 q8 q9; do
         jt="$(median_s jsq "$(qf jsq $q)")"
         qt="$(median_s jq  "$(qf jq  $q)")"
         at="$(median_s jaq "$(qf jaq $q)")"
@@ -69,7 +69,7 @@ bench)
     echo
     echo "| Query | jsq RAM | jq RAM | jaq RAM | jsq RSS | jq RSS | jaq RSS |"
     echo "|-------|--------:|-------:|--------:|--------:|-------:|--------:|"
-    for q in q1 q2 q3 q4; do
+    for q in q1 q2 q3 q4 q5 q6 q7 q8 q9; do
         read -r jfp jrss <<<"$(peak_mem jsq "$(qf jsq $q)")"
         read -r qfp qrss <<<"$(peak_mem jq  "$(qf jq  $q)")"
         read -r afp arss <<<"$(peak_mem jaq "$(qf jaq $q)")"

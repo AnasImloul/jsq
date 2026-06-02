@@ -1,0 +1,6 @@
+from .events[] as e
+join .users[] as u on u.user_id == e.user_id
+unnest e.items as it
+where e.status == "paid"
+aggregate { lines: count(), qty: sum(it.qty) } by u.tier
+order by .qty desc

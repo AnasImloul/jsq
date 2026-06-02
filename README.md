@@ -112,12 +112,12 @@ query, three file sizes (wall time / RAM):
 
 | File   | jsq | jq | jaq | jsq RAM | jq RAM | jaq RAM |
 |--------|----:|---:|----:|--------:|-------:|--------:|
-| 10 MB  |  0.25s |  0.47s |  0.24s | 30 MiB | 170 MiB | 153 MiB |
-| 100 MB |  0.64s |  4.53s |  2.14s | 33 MiB | 1.7 GB  | 1.5 GB  |
-| 1 GB   |  5.00s | 52.05s | 25.13s | 34 MiB |  17 GB  |  15 GB  |
+| 10 MB  |  0.26s |  0.45s |  0.24s | 30 MiB | 167 MiB | 154 MiB |
+| 100 MB |  0.60s |  3.81s |  1.77s | 33 MiB | 1.7 GB  | 1.5 GB  |
+| 1 GB   |  7.00s | 68.98s | 28.37s | 34 MiB |  17 GB  |  15 GB  |
 
 "RAM" is the real memory the process owns — the figure Activity Monitor shows. At 1 GB
-jsq answers in ~5s holding **34 MiB**; jaq, despite being a fast Rust rewrite, still needs
+jsq answers in ~7s holding **34 MiB**; jaq, despite being a fast Rust rewrite, still needs
 **~15 GB** because it parses everything. **The memory win is the streaming architecture,
 not the language** — jsq beats jaq on RAM by the same ~450× it beats jq.
 

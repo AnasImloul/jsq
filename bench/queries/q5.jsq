@@ -1,0 +1,4 @@
+from .events[] as e
+join .users[] as u on u.user_id == e.user_id
+aggregate { revenue: sum(e.amount) } by u.tier
+order by .tier

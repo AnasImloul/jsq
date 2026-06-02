@@ -1,1 +1,3 @@
-from .events[] as e aggregate { revenue: sum(e.amount), n: count(), avg: avg(e.amount) } by e.region order by .revenue desc
+from .events[] as e
+aggregate { revenue: sum(e.amount), n: count(), avg: avg(e.amount) } by e.region
+order by .revenue desc
