@@ -1,0 +1,1 @@
+from .events[] as e where e.amount > 500 select { id: e.id, amount: e.amount }

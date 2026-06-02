@@ -1,0 +1,1 @@
+.events[] | select(.amount > 500) | {id, amount}

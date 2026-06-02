@@ -1,0 +1,1 @@
+from .events[] as e where e.status == "paid" aggregate { n: count() }

@@ -1,0 +1,1 @@
+reduce (.events[] | select(.status == "paid")) as $e (0; . + 1)
