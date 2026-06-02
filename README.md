@@ -33,7 +33,10 @@ scripts/   Shared build helpers (build-engine.sh, release.sh).
 brew tap AnasImloul/homebrew-tap
 brew install jsq
 
-# CLI — from source (needs the Rust toolchain)
+# CLI — crates.io (needs the Rust toolchain)
+cargo install jsql        # the crate is `jsql`; it installs the `jsq` command
+
+# CLI — from source
 cd engine && cargo install --path .
 ```
 
