@@ -213,3 +213,101 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
+
+  tap:
+    name: Bump Homebrew formula
+    # Runs after the CLI tarballs are on the release so their checksums
+    # can be computed from the published artifacts. Only on a real tag
+    # push. Needs a PAT with contents:write on AnasImloul/homebrew-tap
+    # (the built-in GITHUB_TOKEN can't push to another repo) supplied as
+    # the HOMEBREW_TAP_TOKEN secret.
+    needs: cli
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: AnasImloul/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Regenerate jsq.rb
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          base="https://github.com/AnasImloul/jsq/releases/download/${tag}"
+          declare -A sha
+          for a in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+            url="${base}/jsq_${ver}_${a}.tar.gz"
+            curl -fsSL "$url" -o "jsq_${a}.tar.gz"
+            sha[$a]="$(sha256sum "jsq_${a}.tar.gz" | cut -d' ' -f1)"
+          done
+          cat > tap/Formula/jsq.rb <<EOF
+          # typed: false
+          # frozen_string_literal: true
+
+          class Jsq < Formula
+            desc "SQL-shaped query language for very large JSON files"
+            homepage "https://github.com/AnasImloul/jsq"
+            version "${ver}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.intel?
+                url "${base}/jsq_${ver}_darwin_amd64.tar.gz"
+                sha256 "${sha[darwin_amd64]}"
+
+                def install
+                  bin.install "jsq"
+                end
+              end
+              if Hardware::CPU.arm?
+                url "${base}/jsq_${ver}_darwin_arm64.tar.gz"
+                sha256 "${sha[darwin_arm64]}"
+
+                def install
+                  bin.install "jsq"
+                end
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
+                url "${base}/jsq_${ver}_linux_amd64.tar.gz"
+                sha256 "${sha[linux_amd64]}"
+                def install
+                  bin.install "jsq"
+                end
+              end
+              if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+                url "${base}/jsq_${ver}_linux_arm64.tar.gz"
+                sha256 "${sha[linux_arm64]}"
+                def install
+                  bin.install "jsq"
+                end
+              end
+            end
+
+            test do
+              (testpath/"t.json").write('{"events":[1,2,3]}')
+              output = shell_output("#{bin}/jsq #{testpath}/t.json 'from .events[] as e aggregate { n: count() }'")
+              assert_match "3", output
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/jsq.rb
+          git commit -m "jsq ${GITHUB_REF_NAME#v}"
+          git push
