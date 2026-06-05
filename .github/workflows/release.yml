@@ -226,6 +226,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
+          # Keep the release a draft — otherwise this upload defaults to
+          # draft:false and publishes it before the desktop bundles land.
+          # `publish-release` flips it once every artifact is attached.
+          draft: true
           fail_on_unmatched_files: true
           files: ${{ steps.pkg.outputs.path }}
 
