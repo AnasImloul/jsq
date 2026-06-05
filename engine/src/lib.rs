@@ -1,5 +1,6 @@
 //! Big-JSON engine. Streaming parser + offset index for very large JSON
-//! files, exposed to Swift through a small C ABI.
+//! files, with a flat function surface (the `ffi` module) the desktop
+//! app's Rust bridge calls into.
 //!
 //! # Index model: hybrid container records
 //!

@@ -1,5 +1,5 @@
 //! Cursor-aware autocomplete classifier. Given a query source and a
-//! cursor position (UTF-16 offset, NSString-compatible), returns:
+//! cursor position (UTF-16 offset, JS string-index compatible), returns:
 //!
 //! * the partial identifier the user is typing,
 //! * what kind of completion makes sense at this position
@@ -420,8 +420,9 @@ fn char_index_to_byte(s: &str, char_idx: usize) -> usize {
 }
 
 /// Truncates `source` at a UTF-16 offset and returns the resulting
-/// (valid) UTF-8 string. NSString cursors are UTF-16 offsets; this
-/// mirrors `String.substring(to: cursor)` in Swift.
+/// (valid) UTF-8 string. The UI sends cursor positions as UTF-16
+/// offsets (JavaScript string indexing); this mirrors `source.slice(0,
+/// cursor)` on that side.
 fn truncate_at_utf16(source: &str, cursor_utf16: u32) -> String {
     let mut units = 0u32;
     let mut byte_end = source.len();

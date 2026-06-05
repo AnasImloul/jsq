@@ -16,7 +16,7 @@
 //!   children (which don't have records under the hybrid emit-gate)
 //!   and the descent helpers.
 //! - [`render`]: result-row formatting (the path/preview/full_text
-//!   triple seen by Swift) and number/string escapers.
+//!   triple seen by the UI) and number/string escapers.
 //!
 //! This file owns only the public surface (`run`, `collect_kinds`,
 //! `collect_keys`, `text_search`), the per-run thread-local state, and
@@ -258,7 +258,7 @@ pub(super) fn lookup_resolved<'a>(canon_key: usize) -> ResolvedIndex<'a> {
 /// Builds and registers a foreign-key index for every `Ast::Lookup`
 /// reachable from `ast` that isn't already in the registry.
 ///
-/// The Swift app builds indexes explicitly over FFI and reuses them
+/// The desktop app builds indexes explicitly over FFI and reuses them
 /// across many queries against the same document; the `jsq` CLI runs a
 /// single query and exits, so it calls this once to make joins work
 /// without a separate build step. Deduplicates by canonical
@@ -442,10 +442,10 @@ fn collect_lookups_in_agg_output<'a>(
     }
 }
 
-/// Result row crossed back to FFI / Swift. Carries the row's value
+/// Result row crossed back over FFI. Carries the row's value
 /// directly; presentation strings (preview, full JSON) are derived on
 /// demand by the renderer or the FFI marshalling layer. `kind` and
-/// `path` are cached because both consumers (CSV type column, Swift
+/// `path` are cached because both consumers (CSV type column, desktop
 /// table view) read them per-row and recomputing the path means
 /// re-walking the ancestor chain.
 #[derive(Clone, Debug)]

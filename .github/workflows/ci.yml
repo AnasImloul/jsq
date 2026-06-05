@@ -1,8 +1,8 @@
 name: CI
 
 # Validates every PR and every push to main: engine tests on Linux
-# (fast, cheap), full macOS app build on macOS (catches Xcode-side
-# regressions before they hit the desktop install).
+# (fast, cheap), plus a desktop build that compiles the Tauri shell
+# against the engine (catches breakage before a release tag does).
 
 on:
   push:
@@ -39,36 +39,44 @@ jobs:
       - name: Test
         run: cargo test --all-targets --locked
 
-  app:
-    name: macOS app build
-    runs-on: macos-latest
+  desktop:
+    name: Desktop build (Tauri)
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
 
       - name: Cache cargo deps
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: engine
+          workspaces: desktop/src-tauri
 
-      # `build-engine.sh` builds the Rust static library and stages
-      # libengine.a + engine.h at the paths Xcode's build phase
-      # expects, so the next step just consumes them.
-      - name: Build engine static library
-        run: scripts/build-engine.sh
+      - name: Install frontend dependencies
+        working-directory: desktop
+        run: npm ci
 
-      - name: Build app (Debug, ad-hoc signed)
-        run: |
-          xcodebuild \
-            -project app/BigJSON.xcodeproj \
-            -scheme BigJSON \
-            -configuration Debug \
-            -destination 'platform=macOS' \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="-" \
-            build
+      # Type-checks the Svelte frontend and produces dist/, then compiles
+      # the Tauri shell (which links the engine crate). No bundling — CI
+      # only needs to prove it builds; the release workflow packages it.
+      - name: Build frontend
+        working-directory: desktop
+        run: npm run build
+
+      - name: Build Tauri shell
+        working-directory: desktop/src-tauri
+        run: cargo build --locked

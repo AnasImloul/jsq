@@ -1,5 +1,5 @@
 //! Output formatters for query results — the single source of truth
-//! both the Swift app's export menu and the `jsq` CLI delegate to.
+//! both the desktop app's export menu and the `jsq` CLI delegate to.
 //!
 //! Each renderer takes the same `(results, &Document)` pair and produces
 //! a UTF-8 string in the chosen format. Every row carries its value

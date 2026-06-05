@@ -3,7 +3,7 @@
 //! [`super::children`] instead — those calls accept `(parent, source
 //! offset/length)` rather than a node id.
 
-use crate::document::{Document, FLAG_ARRAY_ELEMENT, FLAG_OBJECT_MEMBER, NULL_NODE};
+use crate::document::{Document, FLAG_ARRAY_ELEMENT, NULL_NODE};
 
 use super::{EngineOwnedBytes, EngineSlice};
 
@@ -17,18 +17,6 @@ pub extern "C" fn engine_node_kind(doc: *const Document, node: u32) -> u8 {
 pub extern "C" fn engine_node_parent(doc: *const Document, node: u32) -> u32 {
     let Some(d) = (unsafe { doc.as_ref() }) else { return NULL_NODE };
     d.record(node).map(|r| r.parent).unwrap_or(NULL_NODE)
-}
-
-#[no_mangle]
-pub extern "C" fn engine_node_first_child(doc: *const Document, node: u32) -> u32 {
-    let Some(d) = (unsafe { doc.as_ref() }) else { return NULL_NODE };
-    d.first_skippable_child(node)
-}
-
-#[no_mangle]
-pub extern "C" fn engine_node_next_sibling(doc: *const Document, node: u32) -> u32 {
-    let Some(d) = (unsafe { doc.as_ref() }) else { return NULL_NODE };
-    d.next_skippable_sibling(node)
 }
 
 #[no_mangle]
@@ -59,8 +47,8 @@ pub extern "C" fn engine_node_value_bytes(doc: *const Document, node: u32) -> En
 }
 
 /// Returns a borrowed slice into either the source mmap (`source_flag != 0`)
-/// or the document's decoded keys arena (`source_flag == 0`). Used by Swift
-/// to read primitive children's key/value bytes via the offsets carried in
+/// or the document's decoded keys arena (`source_flag == 0`). Reads a
+/// primitive child's key/value bytes via the offsets carried in
 /// `EngineChildMeta`. The returned pointer is valid for the document's
 /// lifetime.
 #[no_mangle]
@@ -115,41 +103,12 @@ pub extern "C" fn engine_node_is_array_element(doc: *const Document, node: u32) 
 }
 
 #[no_mangle]
-pub extern "C" fn engine_node_is_object_member(doc: *const Document, node: u32) -> u8 {
-    let Some(d) = (unsafe { doc.as_ref() }) else { return 0 };
-    match d.record(node) {
-        Some(r) if r.flags & FLAG_OBJECT_MEMBER != 0 => 1,
-        _ => 0,
-    }
-}
-
-#[no_mangle]
 pub extern "C" fn engine_node_path(doc: *const Document, node: u32) -> EngineOwnedBytes {
     let Some(d) = (unsafe { doc.as_ref() }) else {
         return EngineOwnedBytes { data: std::ptr::null_mut(), length: 0 };
     };
     let bytes = crate::path::compute_path(d, node);
     owned_from_vec(bytes)
-}
-
-/// jq-style path for the `slot`-th child of `parent`. Works uniformly
-/// for record-bearing and primitive children — the engine decodes raw
-/// source-key bytes itself, so callers don't reimplement segment
-/// formatting or escape handling. `{NULL, 0}` on a non-container
-/// parent or out-of-range slot.
-#[no_mangle]
-pub extern "C" fn engine_node_child_path(
-    doc: *const Document,
-    parent: u32,
-    slot: u32,
-) -> EngineOwnedBytes {
-    let Some(d) = (unsafe { doc.as_ref() }) else {
-        return EngineOwnedBytes { data: std::ptr::null_mut(), length: 0 };
-    };
-    match crate::path::compute_child_path(d, parent, slot) {
-        Some(bytes) => owned_from_vec(bytes),
-        None => EngineOwnedBytes { data: std::ptr::null_mut(), length: 0 },
-    }
 }
 
 /// Decodes a JSON-string byte span (the bytes *between* the surrounding

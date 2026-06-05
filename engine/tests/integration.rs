@@ -243,7 +243,7 @@ fn children_meta_batch_interleaves_primitives() {
 
     // The new FFI-side scanner should expose all 3 children. We exercise
     // it via the FFI entry point directly to lock in the contract the
-    // Swift bridge depends on.
+    // desktop app's bridge depends on.
     use engine::ffi::{engine_node_children_meta_batch, EngineChildMeta};
     let mut buf: Vec<EngineChildMeta> = vec![
         EngineChildMeta {

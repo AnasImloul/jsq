@@ -2,7 +2,7 @@
 //!
 //! Thin wrapper: parse args, hand the query to the engine, render the
 //! result set via `engine::render`, write to stdout. Every byte the
-//! user sees is produced by code that also serves the Swift app — no
+//! user sees is produced by code that also serves the desktop app — no
 //! parallel implementation.
 
 use std::io::{self, Read, Write};

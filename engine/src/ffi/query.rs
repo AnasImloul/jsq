@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
-use crate::document::{Document, NULL_NODE};
+use crate::document::{Document, NodeKind, NULL_NODE};
 use crate::query::evaluator::QueryResult;
 use crate::query::evaluator::render as value_render;
 use crate::query::value::Value;
@@ -52,7 +52,7 @@ pub struct QueryResults {
     /// memory-bandwidth-bound queries — when this approaches the
     /// file size the engine touched most of the document.
     pub scanned_bytes: u64,
-    /// Per-row presentation strings (`(preview, full_text)`) the Swift
+    /// Per-row presentation strings (`(preview, full_text)`) the desktop
     /// table view reads via `engine_query_results_at`. Built eagerly so
     /// the FFI handle owns the bytes for its full lifetime — `_at`
     /// hands out borrowed slices into these strings, so they need a
@@ -71,8 +71,17 @@ fn build_presentation(results: &[QueryResult], doc: &Document) -> Vec<RowPresent
         .iter()
         .map(|r| {
             let preview = value_render::value_preview(doc, &r.value, 80);
+            // Document-backed containers are rendered lazily by the UI: it
+            // fetches their children on demand by node id and never reads
+            // full_text. Serializing the whole subtree here would copy the
+            // entire node across the FFI/IPC boundary for nothing (seconds on
+            // a 90MB row). Only scalars and synthetic values need full_text.
+            let is_node_container = matches!(r.value, Value::Node(_))
+                && (r.kind == NodeKind::Array as u8 || r.kind == NodeKind::Object as u8);
             let mut full_text = String::new();
-            value_render::write_value_json(&mut full_text, doc, &r.value);
+            if !is_node_container {
+                value_render::write_value_json(&mut full_text, doc, &r.value);
+            }
             RowPresentation { preview, full_text }
         })
         .collect()
@@ -191,7 +200,7 @@ pub extern "C" fn engine_query_run(
 /// node and emits any whose object key OR primitive value contains the
 /// (case-insensitive ASCII) needle. Bypasses the jq parser entirely so
 /// users don't have to know jq syntax — typing a leading `/` in the
-/// query bar routes to this on the Swift side.
+/// query bar routes to this.
 #[no_mangle]
 pub extern "C" fn engine_query_text_search(
     doc: *const Document,
@@ -279,9 +288,9 @@ pub extern "C" fn engine_query_results_at(
     let Some(present) = r.presentation.get(idx as usize) else {
         return EngineQueryResultView::empty();
     };
-    // `node_id` is the only Swift-side click-through hint. For real
+    // `node_id` is the only UI-side click-through hint. For real
     // document nodes it's the record id; for synthetic rows we surface
-    // NULL_NODE so the table view's `nodeID != nil` check skips them.
+    // NULL_NODE so the table view's "has node id" check skips them.
     // GroupList rows used to advertise their first member's id so the
     // inspector could jump into the bucket — preserve that here.
     let node_id = match &item.value {
@@ -301,45 +310,7 @@ pub extern "C" fn engine_query_results_at(
 
 // ----------------------------------------------------------------------------
 // Output formatters
-//
-// Both the Swift app's export menu and the `jsq` CLI delegate here so
-// the result-row → bytes transformation lives in exactly one place.
-// Each function returns owned UTF-8 bytes the caller frees via
-// `engine_free_owned_bytes`.
 // ----------------------------------------------------------------------------
-
-#[no_mangle]
-pub extern "C" fn engine_render_ndjson(
-    results: *const QueryResults,
-    doc: *const Document,
-) -> EngineOwnedBytes {
-    let empty = EngineOwnedBytes { data: std::ptr::null_mut(), length: 0 };
-    let Some(r) = (unsafe { results.as_ref() }) else { return empty };
-    let Some(d) = (unsafe { doc.as_ref() }) else { return empty };
-    string_to_owned_bytes(crate::render::render_ndjson(&r.results, d))
-}
-
-#[no_mangle]
-pub extern "C" fn engine_render_json_array(
-    results: *const QueryResults,
-    doc: *const Document,
-) -> EngineOwnedBytes {
-    let empty = EngineOwnedBytes { data: std::ptr::null_mut(), length: 0 };
-    let Some(r) = (unsafe { results.as_ref() }) else { return empty };
-    let Some(d) = (unsafe { doc.as_ref() }) else { return empty };
-    string_to_owned_bytes(crate::render::render_json_array(&r.results, d))
-}
-
-#[no_mangle]
-pub extern "C" fn engine_render_csv(
-    results: *const QueryResults,
-    doc: *const Document,
-) -> EngineOwnedBytes {
-    let empty = EngineOwnedBytes { data: std::ptr::null_mut(), length: 0 };
-    let Some(r) = (unsafe { results.as_ref() }) else { return empty };
-    let Some(d) = (unsafe { doc.as_ref() }) else { return empty };
-    string_to_owned_bytes(crate::render::render_csv(&r.results, d))
-}
 
 /// Render-format discriminant for `engine_query_run_and_render`.
 pub const ENGINE_RENDER_NDJSON: u8 = 0;
@@ -347,10 +318,9 @@ pub const ENGINE_RENDER_JSON_ARRAY: u8 = 1;
 pub const ENGINE_RENDER_CSV: u8 = 2;
 
 /// One-shot helper that runs `query` against `doc` and immediately
-/// renders the result set in the requested format. Used by the Swift
-/// app's export menu, which doesn't hold onto query-results handles
-/// long enough to call the per-format renderers separately. The CLI
-/// keeps the handle and uses the per-format renderers directly.
+/// renders the result set in the requested format, for callers that
+/// don't hold onto a query-results handle long enough to call the
+/// per-format renderers separately.
 ///
 /// Returns owned UTF-8 bytes (free with `engine_free_owned_bytes`) or
 /// `{NULL, 0}` on parse / lookup error — in the parse-error case the
@@ -502,8 +472,8 @@ pub extern "C" fn engine_keys_for_query(
 // ----------------------------------------------------------------------------
 
 /// JSON dump of the surface-language grammar manifest. Stable shape —
-/// see `query::grammar::manifest_json`. Cached on the Swift side; the
-/// process-lifetime contract is "Rust is the source of truth, Swift
+/// see `query::grammar::manifest_json`. Cached on the UI side; the
+/// process-lifetime contract is "Rust is the source of truth, the UI
 /// reads it once".
 #[no_mangle]
 pub extern "C" fn engine_grammar_manifest() -> EngineOwnedBytes {
@@ -512,12 +482,12 @@ pub extern "C" fn engine_grammar_manifest() -> EngineOwnedBytes {
 
 /// Tokenises `source` for the UI highlighter. Returns a JSON array of
 /// `{"category": "...", "offset": N, "length": M}` triples, where
-/// offset and length are in **UTF-16 code units** to match Swift's
-/// NSString / NSRange layout.
+/// offset and length are in **UTF-16 code units** to match JavaScript's
+/// string indexing (`String.length` / `.slice`).
 ///
 /// Forgiving — never fails. Unrecognised bytes surface as `error`
 /// tokens, malformed strings as a single `string` token to EOF, etc.
-/// The Swift highlighter walks this list per keystroke and maps each
+/// The UI highlighter walks this list per keystroke and maps each
 /// `category` to a colour.
 ///
 /// Returns `{NULL, 0}` only if `source` is null or non-UTF-8.
@@ -565,7 +535,7 @@ pub extern "C" fn engine_tokenize(source: *const c_char) -> EngineOwnedBytes {
 /// }
 /// ```
 ///
-/// `cursor_utf16` is in UTF-16 code units (NSString-compatible). Returns
+/// `cursor_utf16` is in UTF-16 code units (JS string-index compatible). Returns
 /// `{NULL, 0}` when the cursor is in a position that doesn't admit
 /// completions (e.g. mid-token after a number). On null / non-UTF-8
 /// `source` also returns `{NULL, 0}`.

@@ -7,8 +7,8 @@ use std::os::raw::c_char;
 use crate::document::Document;
 use crate::query;
 
+use super::cstr_to_str;
 use super::query::set_query_error;
-use super::{cstr_to_str, push_json_escaped, string_to_owned_bytes, EngineOwnedBytes};
 
 #[repr(C)]
 pub struct EngineIndexStats {
@@ -90,55 +90,3 @@ pub extern "C" fn engine_query_create_index(
     stats
 }
 
-/// Drops the index registered for `(source_expr, key_expr)` if any.
-/// Returns 1 if an index was removed, 0 otherwise. Both arguments must
-/// match the *canonical* form of the expressions — typically supplied
-/// by `engine_query_list_indexes` rather than typed by the user.
-#[no_mangle]
-pub extern "C" fn engine_query_drop_index(
-    doc: *const Document,
-    source_canon: *const c_char,
-    key_canon: *const c_char,
-) -> u8 {
-    let Some(d) = (unsafe { doc.as_ref() }) else { return 0 };
-    let Some(src) = (unsafe { cstr_to_str(source_canon) }) else { return 0 };
-    let Some(key) = (unsafe { cstr_to_str(key_canon) }) else { return 0 };
-    if let Ok(mut reg) = d.indexes.lock() {
-        if reg.remove(src, key) { 1 } else { 0 }
-    } else {
-        0
-    }
-}
-
-/// Returns a JSON array of the registered indexes, each shaped like
-/// `{"source": "...", "key": "...", "source_count": N, "indexed_count": M, "bucket_count": K, "approx_bytes": B}`.
-/// Caller owns the returned bytes — free with `engine_free_owned_bytes`.
-#[no_mangle]
-pub extern "C" fn engine_query_list_indexes(doc: *const Document) -> EngineOwnedBytes {
-    let empty = EngineOwnedBytes { data: std::ptr::null_mut(), length: 0 };
-    let Some(d) = (unsafe { doc.as_ref() }) else { return empty };
-    let reg = match d.indexes.lock() {
-        Ok(g) => g,
-        Err(_) => return empty,
-    };
-    let entries = reg.list();
-    let mut json = String::from("[");
-    for (i, (src, key, idx)) in entries.iter().enumerate() {
-        if i > 0 { json.push(','); }
-        json.push_str("{\"source\":\"");
-        push_json_escaped(&mut json, src);
-        json.push_str("\",\"key\":\"");
-        push_json_escaped(&mut json, key);
-        json.push_str("\",\"source_count\":");
-        json.push_str(&idx.source_count.to_string());
-        json.push_str(",\"indexed_count\":");
-        json.push_str(&idx.indexed_count.to_string());
-        json.push_str(",\"bucket_count\":");
-        json.push_str(&idx.buckets.len().to_string());
-        json.push_str(",\"approx_bytes\":");
-        json.push_str(&idx.approx_bytes().to_string());
-        json.push('}');
-    }
-    json.push(']');
-    string_to_owned_bytes(json)
-}

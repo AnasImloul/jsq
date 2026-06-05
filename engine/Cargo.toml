@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "parser-implementations"]
 
 [lib]
 name = "engine"
-crate-type = ["staticlib", "rlib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "jsq"

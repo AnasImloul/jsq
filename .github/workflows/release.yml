@@ -1,20 +1,31 @@
 name: Release
 
-# Cuts a new release of the macOS app. Triggered by pushing a tag that
-# matches `v*` (e.g. `git tag v0.1.0 && git push --tags`), or manually
-# from the Actions tab via workflow_dispatch.
+# Cuts a new release. Triggered by pushing a tag that matches `v*`
+# (e.g. `git tag v0.1.0 && git push --tags`), or manually from the
+# Actions tab via workflow_dispatch.
 #
 # Produces:
-#   - BigJSON-<version>.dmg attached to the GitHub release
+#   - BigJSON desktop bundles for macOS (arm64 + x86_64), Windows, and
+#     Linux, built with Tauri and attached to the GitHub release
 #   - jsq CLI tarballs (macOS + Linux, arm64 + amd64) on the release
 #   - the jsql crate published to crates.io (requires the
 #     CARGO_REGISTRY_TOKEN repo secret; only on a real tag push)
 #
-# The .dmg is ad-hoc signed by default — users will see a Gatekeeper
-# warning on first launch (right-click → Open to bypass). Promote to
-# Developer-ID signing + notarization by setting the secrets listed
-# at the bottom of scripts/release.sh and the matching `env` block
-# below.
+# The crate publish and Homebrew bump are gated on whether the version in
+# engine/Cargo.toml is actually new on crates.io. This decouples the
+# desktop app's release cadence from the engine/CLI: tagging a
+# desktop-only release ships fresh bundles while leaving the unchanged
+# crate (and its Homebrew formula) untouched, instead of failing on a
+# re-publish of an already-uploaded version.
+#
+# Flow: a draft release is created first, every build job uploads its
+# artifacts to it, then the release is published once the desktop and
+# CLI builds succeed. The Homebrew tap bump runs last because it reads
+# the published (non-draft) release assets over HTTP.
+#
+# The desktop bundles are unsigned by default — users get an OS
+# "unidentified developer" warning on first launch. Add platform signing
+# secrets to tauri-action later to promote to a clean UX.
 
 on:
   push:
@@ -23,92 +34,136 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version tag to use for the .dmg name (e.g. v0.1.0)"
+        description: "Version tag to use for the release (e.g. v0.1.0)"
         required: true
         type: string
 
 permissions:
-  # Needed to create the release and upload the .dmg via
-  # softprops/action-gh-release.
   contents: write
 
 jobs:
-  build:
-    name: Build .dmg and publish release
-    runs-on: macos-latest
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.value }}
+      crate_publish: ${{ steps.crate.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          # The release script reads `git rev-parse --short HEAD` as
-          # the fallback version label — full history isn't needed,
-          # but a shallow checkout still gets us the SHA.
-          fetch-depth: 1
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
-
-      - name: Cache cargo deps
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: engine
 
       - name: Resolve version label
         id: version
         run: |
           if [[ -n "${{ inputs.tag }}" ]]; then
-            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            tag="${{ inputs.tag }}"
           else
             # Tag push — refs/tags/v0.1.0 → v0.1.0
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            tag="${GITHUB_REF_NAME}"
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Drop the leading v for tarball / crate naming (v1.0.0 -> 1.0.0).
+          echo "value=${tag#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Build .dmg
-        # Optional Developer-ID signing + notarization. All five env
-        # vars must be set as repo secrets to activate. With none of
-        # them set, release.sh falls back to ad-hoc signing — fine
-        # for early releases, but the user gets a Gatekeeper warning
-        # on first launch.
-        env:
-          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          NOTARIZE: ${{ secrets.APPLE_APP_PASSWORD && '1' || '0' }}
-        run: scripts/release.sh "${{ steps.version.outputs.value }}"
-
-      - name: Locate built .dmg
-        id: dmg
+      - name: Detect whether the engine crate version is new
+        id: crate
         run: |
-          dmg="$(ls build/BigJSON-*.dmg | head -n1)"
-          if [[ -z "$dmg" ]]; then
-            echo "no .dmg found under build/" >&2
-            exit 1
+          set -euo pipefail
+          ver="$(grep -m1 '^version' engine/Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')"
+          echo "engine crate version: $ver"
+          # crates.io sparse index: one JSON object per published version.
+          # Name >= 4 chars → /{first2}/{next2}/{name}.
+          index="$(curl -fsSL https://index.crates.io/js/ql/jsql || true)"
+          if printf '%s' "$index" | grep -qF "\"vers\":\"$ver\""; then
+            echo "Version $ver already on crates.io — skipping crate publish + Homebrew bump."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version $ver not yet published — will publish crate + bump Homebrew."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "path=$dmg" >> "$GITHUB_OUTPUT"
 
-      - name: Publish GitHub release
+      - name: Create draft release
+        id: release
         uses: softprops/action-gh-release@v2
         with:
-          # When triggered manually, the workflow may not have a tag
-          # to attach to — pass the resolved name explicitly so the
-          # action creates the release under it. For a tag push,
-          # `tag_name` defaults to `github.ref_name`, but being
-          # explicit costs nothing.
-          tag_name: ${{ steps.version.outputs.value }}
-          name: ${{ steps.version.outputs.value }}
-          draft: false
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          draft: true
           prerelease: false
-          fail_on_unmatched_files: true
           generate_release_notes: true
-          files: ${{ steps.dmg.outputs.path }}
+
+  desktop:
+    name: Desktop (${{ matrix.label }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            label: macos-arm64
+            args: "--target aarch64-apple-darwin"
+            rust-targets: aarch64-apple-darwin
+          - platform: macos-latest
+            label: macos-x64
+            args: "--target x86_64-apple-darwin"
+            rust-targets: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            label: linux-x64
+            args: ""
+            rust-targets: ""
+          - platform: windows-latest
+            label: windows-x64
+            args: ""
+            rust-targets: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri's Linux bundler (webkit2gtk + the AppImage/.deb tooling)
+      # needs these system libraries; they're preinstalled on the macOS
+      # and Windows runners.
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache cargo deps
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+          key: ${{ matrix.label }}
+
+      - name: Install frontend dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build and upload bundles
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: ${{ matrix.args }}
 
   cli:
     name: Build jsq CLI (${{ matrix.goos }}/${{ matrix.goarch }})
-    # Runs after the .dmg job so the GitHub release already exists; each
-    # matrix leg then just uploads its tarball to it (no create race).
-    needs: build
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -135,19 +190,6 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Resolve version label
-        id: version
-        run: |
-          if [[ -n "${{ inputs.tag }}" ]]; then
-            tag="${{ inputs.tag }}"
-          else
-            tag="${GITHUB_REF_NAME}"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          # Drop the leading v for the tarball name (v1.0.0 -> 1.0.0),
-          # matching the GoReleaser-style naming used by the tap.
-          echo "value=${tag#v}" >> "$GITHUB_OUTPUT"
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -173,7 +215,7 @@ jobs:
       - name: Package tarball
         id: pkg
         run: |
-          ver="${{ steps.version.outputs.value }}"
+          ver="${{ needs.create-release.outputs.version }}"
           name="jsq_${ver}_${{ matrix.goos }}_${{ matrix.goarch }}"
           bin_dir="engine/target/${{ matrix.target }}/release"
           mkdir -p dist
@@ -183,17 +225,18 @@ jobs:
       - name: Upload CLI tarball to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
+          tag_name: ${{ needs.create-release.outputs.tag }}
           fail_on_unmatched_files: true
           files: ${{ steps.pkg.outputs.path }}
 
   crates:
     name: Publish jsql to crates.io
     # Only on a real tag push — a manual workflow_dispatch run shouldn't
-    # publish to the immutable registry. Gated on the .dmg build so a
-    # broken release never lands on crates.io.
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # publish to the immutable registry. Gated on the desktop + CLI builds
+    # so a broken release never lands on crates.io, and skipped entirely
+    # when the version is already published (desktop-only release).
+    needs: [create-release, desktop, cli]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.create-release.outputs.crate_publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -214,15 +257,33 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
 
+  publish-release:
+    name: Publish release
+    # Flip the draft to published only after every artifact is attached.
+    needs: [create-release, desktop, cli]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark release as published
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: ${{ needs.create-release.outputs.release_id }},
+              draft: false,
+            });
+
   tap:
     name: Bump Homebrew formula
-    # Runs after the CLI tarballs are on the release so their checksums
-    # can be computed from the published artifacts. Only on a real tag
-    # push. Needs a PAT with contents:write on AnasImloul/homebrew-tap
-    # (the built-in GITHUB_TOKEN can't push to another repo) supplied as
-    # the HOMEBREW_TAP_TOKEN secret.
-    needs: cli
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Runs after the release is published so the CLI tarball URLs resolve
+    # over HTTP (draft-release assets aren't publicly downloadable). Only
+    # on a real tag push. Needs a PAT with contents:write on
+    # AnasImloul/homebrew-tap (the built-in GITHUB_TOKEN can't push to
+    # another repo) supplied as the HOMEBREW_TAP_TOKEN secret. Skipped on
+    # a desktop-only release, where the CLI version is unchanged.
+    needs: [create-release, publish-release]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.create-release.outputs.crate_publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out homebrew-tap

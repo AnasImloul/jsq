@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+- Replaced the macOS-only SwiftUI app with a cross-platform desktop app
+  (Tauri + Svelte). Releases now ship desktop bundles for macOS (Apple Silicon +
+  Intel), Windows, and Linux.
+
+### Removed
+- The Swift/Xcode app and its C-ABI build glue (static library, hand-written
+  `engine.h` header, and the unused FFI functions only it consumed).
+
 ## [1.1.0] - 2026-06-02
 
 ### Added

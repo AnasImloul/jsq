@@ -1,4 +1,4 @@
-//! Invariants over the grammar manifest. The Rust parser and the Swift
+//! Invariants over the grammar manifest. The Rust parser and the desktop
 //! UI both read from `query::grammar`; these tests are the only
 //! mechanism that prevents the manifest's serialised JSON shape from
 //! drifting away from what the parser actually accepts.
@@ -106,8 +106,8 @@ fn keyword_categories_are_self_consistent() {
 #[test]
 fn manifest_json_is_well_formed() {
     let json = grammar::manifest_json();
-    // Light sanity check — full schema verification lives on the Swift
-    // side where the JSON is decoded into typed structs.
+    // Light sanity check — full schema verification lives on the
+    // frontend side where the JSON is decoded into typed structs.
     assert!(json.starts_with('{'));
     assert!(json.ends_with('}'));
     assert!(json.contains("\"keywords\":["));
@@ -158,9 +158,9 @@ fn punctuation_lists_every_lexer_kind() {
 }
 
 #[test]
-fn role_filters_match_existing_swift_lists() {
-    // Acts as a regression test against the lists the Swift
-    // AutocompleteContext hard-codes. If you intentionally narrow or
+fn role_filters_match_autocomplete_lists() {
+    // Acts as a regression test against the lists the frontend
+    // autocomplete hard-codes. If you intentionally narrow or
     // widen the set, update both lists below.
     let value_start_expected = [
         "from", "fields", "not", "null", "true", "false",

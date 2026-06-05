@@ -7,8 +7,8 @@ is light.
 
 - `engine/` — the Rust crate: query engine, parser, evaluator, FFI, and the `jsq`
   binary. Self-contained; builds on macOS, Linux, and Windows.
-- `app/` — the SwiftUI macOS app. A thin layer over the engine's C ABI.
-- `scripts/` — shared build helpers (`build-engine.sh`, `release.sh`).
+- `desktop/` — the Tauri + Svelte desktop app. A thin layer that links the engine
+  crate directly.
 
 Every semantic decision — query syntax, evaluation, output formatting — lives in
 `engine/`. The app consumes results and adds no query logic of its own, so most
@@ -32,22 +32,26 @@ update the grammar table and that manifest test will keep everything in sync.
 `engine/tests/query_surface.rs` has runnable examples covering every clause; it's the
 best place to add a regression test for a language change.
 
-## macOS app (Swift)
+## Desktop app (Tauri + Svelte)
 
 ```sh
-cd app
-open BigJSON.xcodeproj            # then ⌘R, or:
-xcodebuild -project BigJSON.xcodeproj -scheme BigJSON -configuration Debug build
+cd desktop
+npm install
+npm run tauri dev                # run the app locally
+npm run tauri build              # build a platform bundle
+npm run check                    # type-check the Svelte frontend
 ```
 
-The "Build Rust engine" build phase runs `scripts/build-engine.sh` automatically, so
-`cargo` is the only out-of-band dependency.
+The Tauri shell (`desktop/src-tauri/`) depends on the engine crate via a path
+dependency, so `cargo` and a Node toolchain are the only out-of-band requirements.
+On Linux you also need the webkit2gtk dev libraries (see `.github/workflows/ci.yml`
+for the exact packages).
 
 ## Pull requests
 
 - Keep changes focused; one logical change per PR.
 - Run `cargo test`, `cargo fmt`, and `cargo clippy` before opening a PR. CI runs the
-  engine tests on Linux and a full app build on macOS.
+  engine tests on Linux and a desktop (Tauri) build.
 - Add or update tests for behavior changes, especially anything touching the query
   language.
 - Update [docs/QUERY.md](docs/QUERY.md) and [CHANGELOG.md](CHANGELOG.md) when you

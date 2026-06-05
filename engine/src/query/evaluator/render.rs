@@ -141,7 +141,7 @@ fn write_node_json(out: &mut String, doc: &Document, id: u32) {
 }
 
 /// Short, human-friendly value rendering used for the CSV/TSV preview
-/// column and the Swift table view. Containers collapse to a `[N items]`
+/// column and the desktop table view. Containers collapse to a `[N items]`
 /// / `{N keys}` placeholder; everything else falls through to the JSON
 /// encoding, truncated to `cap` bytes.
 pub(crate) fn value_preview(doc: &Document, v: &Value, cap: usize) -> String {

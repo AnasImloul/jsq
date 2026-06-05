@@ -381,8 +381,8 @@ impl Lexer {
 // ============================================================================
 // UI tokenizer
 //
-// Forgiving scanner used by the Swift highlighter via FFI. Returns spans
-// in UTF-16 code units (offsets compatible with NSTextStorage / NSRange).
+// Forgiving scanner used by the UI highlighter via FFI. Returns spans
+// in UTF-16 code units (matching JavaScript's string indexing).
 // Never fails — emits `Error` tokens for unrecognised bytes, malformed
 // numbers, and unterminated strings so the entire query string is
 // covered without losing characters.

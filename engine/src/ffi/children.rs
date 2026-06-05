@@ -188,59 +188,6 @@ pub extern "C" fn engine_node_children_meta_batch_resume(
     written
 }
 
-/// Fills `out_ids` with up to `max` child IDs starting from the `offset`-th
-/// child of `parent`. Returns the number actually written. Walking the
-/// subtree-size-derived sibling chain inside Rust avoids the per-
-/// iteration FFI overhead the caller would otherwise pay.
-#[no_mangle]
-pub extern "C" fn engine_node_children_batch(
-    doc: *const Document,
-    parent: u32,
-    offset: u32,
-    max: u32,
-    out_ids: *mut u32,
-) -> u32 {
-    if out_ids.is_null() || max == 0 {
-        return 0;
-    }
-    let Some(d) = (unsafe { doc.as_ref() }) else { return 0 };
-    let Some(rec) = d.record(parent) else { return 0 };
-
-    // checked_add hardening: a corrupted subtree_size mustn't wrap
-    // and alias an unrelated record id.
-    let parent_end = parent
-        .checked_add(rec.subtree_size)
-        .unwrap_or(d.records().len() as u32);
-    let mut cur = if rec.subtree_size > 1 {
-        parent.checked_add(1).unwrap_or(NULL_NODE)
-    } else {
-        NULL_NODE
-    };
-    let mut skipped: u32 = 0;
-    while cur != NULL_NODE && skipped < offset {
-        let Some(r) = d.record(cur) else { return 0 };
-        cur = match cur.checked_add(r.subtree_size) {
-            Some(next) if next < parent_end => next,
-            _ => NULL_NODE,
-        };
-        skipped += 1;
-    }
-
-    let mut written: u32 = 0;
-    while cur != NULL_NODE && written < max {
-        unsafe {
-            std::ptr::write(out_ids.add(written as usize), cur);
-        }
-        let Some(r) = d.record(cur) else { break };
-        cur = match cur.checked_add(r.subtree_size) {
-            Some(next) if next < parent_end => next,
-            _ => NULL_NODE,
-        };
-        written += 1;
-    }
-    written
-}
-
 /// Walks one level of `parent`'s children from the start, building an
 /// `EngineChildMeta` for each and feeding it to `sink`. Convenience
 /// wrapper over [`scan_children_resume`] with a fresh state.

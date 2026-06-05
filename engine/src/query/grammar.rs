@@ -1,6 +1,6 @@
 //! Single source of truth for the surface query language vocabulary.
 //!
-//! Both the engine (lexer / parser) and the UI (Swift highlighter +
+//! Both the engine (lexer / parser) and the UI (highlighter +
 //! autocomplete, via FFI) read keyword strings, operator spellings,
 //! and punctuation from this module. Adding a keyword here makes it
 //! visible to the parser, the highlighter and the autocomplete in
@@ -435,7 +435,7 @@ pub fn identifier_category(text: &str) -> TokenCategory {
     }
 }
 
-/// JSON dump of the manifest, eaten by the Swift side.
+/// JSON dump of the manifest, eaten by the UI side.
 ///
 /// Stable shape:
 /// ```json

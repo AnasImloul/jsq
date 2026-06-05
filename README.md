@@ -12,7 +12,7 @@ GB-scale, and prints NDJSON so its output still composes with `jq`, `head`, `wc`
 Two front-ends share one engine:
 
 - **`jsq`** — a cross-platform command-line tool (Rust). Pipes one JSON value per line so the output composes with `jq`, `wc`, `head`, etc.
-- **BigJSON.app** — a native macOS UI (SwiftUI) for interactive exploration: streaming open, virtual rows, filter-as-you-type, exports.
+- **BigJSON** — a cross-platform desktop UI (Tauri + Svelte) for interactive exploration: streaming open, virtual rows, filter-as-you-type, exports.
 
 Both delegate every byte of output and every semantic decision to the same Rust engine — adding a feature is a one-place change.
 
@@ -21,9 +21,8 @@ Both delegate every byte of output and every semantic decision to the same Rust 
 ```
 engine/    Rust crate. The query engine, parser, evaluator, FFI, and `jsq` binary.
            Self-contained; can be built / installed / published independently.
-app/       Swift / Xcode project for the macOS UI. Depends on engine/ via the
-           static library + FFI header that engine's build phase produces.
-scripts/   Shared build helpers (build-engine.sh, release.sh).
+desktop/   Tauri + Svelte desktop UI. Depends on engine/ as a Rust crate
+           (src-tauri links it directly — no FFI).
 ```
 
 ## Install
@@ -40,11 +39,7 @@ cargo install jsql        # the crate is `jsql`; it installs the `jsq` command
 cd engine && cargo install --path .
 ```
 
-The macOS app ships as a `.dmg` on the [releases page](https://github.com/AnasImloul/jsq/releases). It's ad-hoc signed, so on first launch run:
-
-```sh
-xattr -d com.apple.quarantine /Applications/BigJSON.app
-```
+The desktop app ships as platform bundles on the [releases page](https://github.com/AnasImloul/jsq/releases) — `.dmg` for macOS (Apple Silicon + Intel), `.msi`/`.exe` for Windows, and `.AppImage`/`.deb` for Linux. The bundles are unsigned, so the OS shows an "unidentified developer" warning on first launch (on macOS, right-click → Open, or `xattr -d com.apple.quarantine /Applications/BigJSON.app`).
 
 ## Quick start
 
@@ -70,11 +65,13 @@ cat orders.json | jsq - 'from .orders[] as o where o.total > 100'
 Every query emits **NDJSON** (one JSON value per line), so pipe into `jq`, `head`,
 `wc`, etc. for post-processing.
 
-### macOS app
+### Desktop app
 
 ```sh
-open app/BigJSON.xcodeproj          # then ⌘R, or:
-scripts/release.sh                  # builds a signed .dmg in ./build
+cd desktop
+npm install
+npm run tauri dev                   # run the app locally, or:
+npm run tauri build                 # build a platform bundle
 ```
 
 ## Usage

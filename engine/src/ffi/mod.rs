@@ -37,18 +37,14 @@ pub mod query;
 // owns the symbol. The C ABI is already flat at the link level; this
 // just mirrors that for Rust consumers.
 pub use children::{
-    engine_node_children_batch, engine_node_children_kind_counts,
-    engine_node_children_meta_batch, engine_node_children_meta_batch_resume, EngineChildMeta,
-    EngineScanState, ENGINE_SCAN_STATE_FRESH,
+    engine_node_children_kind_counts, engine_node_children_meta_batch,
+    engine_node_children_meta_batch_resume, EngineChildMeta, EngineScanState,
+    ENGINE_SCAN_STATE_FRESH,
 };
-pub use index::{
-    engine_query_create_index, engine_query_drop_index, engine_query_list_indexes,
-    EngineIndexStats,
-};
+pub use index::{engine_query_create_index, EngineIndexStats};
 pub use node::{
     engine_node_array_index, engine_node_byte_length, engine_node_byte_offset,
-    engine_node_child_count, engine_node_first_child, engine_node_is_array_element,
-    engine_node_is_object_member, engine_node_key, engine_node_kind, engine_node_next_sibling,
+    engine_node_child_count, engine_node_is_array_element, engine_node_key, engine_node_kind,
     engine_node_parent, engine_node_path, engine_node_value_bytes, engine_node_value_bytes_at,
 };
 pub use query::{
@@ -58,9 +54,8 @@ pub use query::{
     engine_query_results_free, engine_query_results_hit_limit,
     engine_query_results_lookup_calls, engine_query_results_missing_index_key,
     engine_query_results_missing_index_source, engine_query_results_scanned_bytes,
-    engine_query_results_scanned_rows, engine_query_run, engine_query_text_search,
-    engine_query_run_and_render, engine_render_csv, engine_render_json_array,
-    engine_render_ndjson, engine_tokenize, EngineQueryResultView, QueryResults,
+    engine_query_results_scanned_rows, engine_query_run, engine_query_run_and_render,
+    engine_query_text_search, engine_tokenize, EngineQueryResultView, QueryResults,
 };
 
 // ----------------------------------------------------------------------------
